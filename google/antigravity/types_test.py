@@ -25,6 +25,7 @@ import tempfile
 from typing import Any, cast
 import unittest
 from unittest import mock
+import warnings
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -81,6 +82,16 @@ class ToolCallTest(unittest.TestCase):
     """Verifies that id can be explicitly set."""
     tc = types.ToolCall(id="call_123", name="tool")
     self.assertEqual(tc.id, "call_123")
+
+  def test_step_id_defaults_to_none(self):
+    """Verifies that step_id defaults to None when omitted."""
+    tc = types.ToolCall(name="tool")
+    self.assertIsNone(tc.step_id)
+
+  def test_step_id_explicitly_set(self):
+    """Verifies that step_id can be explicitly set."""
+    tc = types.ToolCall(step_id="traj-1:5", name="tool")
+    self.assertEqual(tc.step_id, "traj-1:5")
 
   def test_extra_fields_ignored(self):
     """Verifies that unknown fields are silently dropped.
@@ -156,6 +167,16 @@ class ToolResultTest(unittest.TestCase):
     tr.id = "call_456"
     self.assertEqual(tr.id, "call_456")
 
+  def test_step_id_defaults_to_none(self):
+    """Verifies that step_id defaults to None when omitted."""
+    tr = types.ToolResult(name="tool")
+    self.assertIsNone(tr.step_id)
+
+  def test_step_id_explicitly_set(self):
+    """Verifies that step_id can be explicitly set."""
+    tr = types.ToolResult(step_id="traj-1:3", name="tool", result="ok")
+    self.assertEqual(tr.step_id, "traj-1:3")
+
   def test_extra_fields_ignored(self):
     """Verifies extra='ignore' on ToolResult.
 
@@ -194,6 +215,9 @@ class StepTest(unittest.TestCase):
     step = types.Step()
     self.assertEqual(step.id, "")
     self.assertEqual(step.step_index, 0)
+    self.assertEqual(step.trajectory_id, "")
+    self.assertEqual(step.parent_trajectory_id, "")
+    self.assertEqual(step.depth, 0)
     self.assertEqual(step.type, types.StepType.UNKNOWN)
     self.assertEqual(step.status, types.StepStatus.UNKNOWN)
     self.assertEqual(step.source, types.StepSource.UNKNOWN)
@@ -263,6 +287,15 @@ class HookResultTest(unittest.TestCase):
     hr = types.HookResult(allow=True)
     hr.allow = False
     self.assertFalse(hr.allow)
+
+  def test_modified_args(self):
+    """Verifies construction and default of modified_args on HookResult."""
+    hr_default = types.HookResult()
+    self.assertIsNone(hr_default.modified_args)
+
+    hr = types.HookResult(allow=True, modified_args={"cmd": "echo safe"})
+    self.assertTrue(hr.allow)
+    self.assertEqual(hr.modified_args, {"cmd": "echo safe"})
 
 
 class QuestionResponseTest(unittest.TestCase):
@@ -588,20 +621,33 @@ class BuiltinToolsTest(parameterized.TestCase):
       ),
       ("start_subagent", types.BuiltinTools.START_SUBAGENT, "start_subagent"),
       ("generate_image", types.BuiltinTools.GENERATE_IMAGE, "generate_image"),
+      ("schedule", types.BuiltinTools.SCHEDULE, "schedule"),
       ("finish", types.BuiltinTools.FINISH, "finish"),
   )
   def test_enum_values(self, enum_member, expected_value):
     """Verifies each enum member has the expected string value."""
     self.assertEqual(enum_member, expected_value)
 
-  def test_read_only_covers_all_tools(self):
-    """Verifies read_only + write tools = full enum.
+  def test_deprecated_returns_legacy_search_tools(self):
+    """Verifies deprecated() returns LIST_DIR, SEARCH_DIR, and FIND_FILE."""
+    self.assertEqual(
+        types.BuiltinTools.deprecated(),
+        [
+            types.BuiltinTools.LIST_DIR,
+            types.BuiltinTools.SEARCH_DIR,
+            types.BuiltinTools.FIND_FILE,
+        ],
+    )
 
-    If a new BuiltinTools member is added without updating either read_only()
-    or this test's write_tools set, the test will fail, forcing the developer
+  def test_read_only_covers_all_tools(self):
+    """Verifies read_only + deprecated + write tools = full enum.
+
+    If a new BuiltinTools member is added without updating either read_only(),
+    deprecated(), or this test's sets, the test will fail, forcing the developer
     to categorize the new tool.
     """
     read_only = set(types.BuiltinTools.read_only())
+    deprecated_tools = set(types.BuiltinTools.deprecated())
     write_tools = {
         types.BuiltinTools.CREATE_FILE,
         types.BuiltinTools.EDIT_FILE,
@@ -612,10 +658,14 @@ class BuiltinToolsTest(parameterized.TestCase):
         types.BuiltinTools.SEARCH_WEB,
     }
     self.assertEqual(
-        read_only | write_tools,
+        read_only | deprecated_tools | write_tools,
         set(types.BuiltinTools),
         "A new BuiltinTools member was added but not categorized in"
-        " read_only() or this test's write_tools set.",
+        " read_only(), deprecated(), or write_tools.",
+    )
+    self.assertFalse(
+        read_only & deprecated_tools,
+        "read_only must not include deprecated tools.",
     )
     self.assertFalse(
         read_only & write_tools,
@@ -623,21 +673,26 @@ class BuiltinToolsTest(parameterized.TestCase):
     )
 
   def test_nondestructive_covers_all_tools(self):
-    """Verifies nondestructive + destructive tools = full enum.
+    """Verifies nondestructive + deprecated + destructive tools = full enum.
 
     If a new BuiltinTools member is added without updating either
-    nondestructive() or this test's destructive_tools set, the test will fail,
+    nondestructive(), deprecated(), or this test's sets, the test will fail,
     forcing the developer to categorize the new tool.
     """
     nondestructive = set(types.BuiltinTools.nondestructive())
+    deprecated_tools = set(types.BuiltinTools.deprecated())
     destructive_tools = {
         types.BuiltinTools.RUN_COMMAND,
     }
     self.assertEqual(
-        nondestructive | destructive_tools,
+        nondestructive | deprecated_tools | destructive_tools,
         set(types.BuiltinTools),
         "A new BuiltinTools member was added but not categorized in"
-        " nondestructive() or this test's destructive_tools set.",
+        " nondestructive(), deprecated(), or destructive_tools.",
+    )
+    self.assertFalse(
+        nondestructive & deprecated_tools,
+        "nondestructive must not include deprecated tools.",
     )
     self.assertFalse(
         nondestructive & destructive_tools,
@@ -657,13 +712,40 @@ class BuiltinToolsTest(parameterized.TestCase):
     """Verifies that none() returns an empty list."""
     self.assertEqual(types.BuiltinTools.none(), [])
 
+  def test_minimal_returns_four_minimal_tools(self):
+    """Verifies that minimal() returns the 4 core software engineering tools."""
+    expected = [
+        types.BuiltinTools.RUN_COMMAND,
+        types.BuiltinTools.VIEW_FILE,
+        types.BuiltinTools.CREATE_FILE,
+        types.BuiltinTools.EDIT_FILE,
+    ]
+    self.assertEqual(types.BuiltinTools.minimal(), expected)
 
-class AgentModeTest(unittest.TestCase):
-  """Tests for the AgentMode enum."""
+  def test_default_excludes_ask_question_and_deprecated_tools(self):
+    """Verifies that default() excludes ASK_QUESTION, LIST_DIR, SEARCH_DIR, and FIND_FILE."""
+    excluded = {
+        types.BuiltinTools.ASK_QUESTION,
+        types.BuiltinTools.LIST_DIR,
+        types.BuiltinTools.SEARCH_DIR,
+        types.BuiltinTools.FIND_FILE,
+    }
+    expected = set(types.BuiltinTools) - excluded
+    self.assertEqual(set(types.BuiltinTools.default()), expected)
+    for tool in excluded:
+      self.assertNotIn(tool, types.BuiltinTools.default())
+    self.assertLen(
+        types.BuiltinTools.default(), len(types.BuiltinTools) - len(excluded)
+    )
+
+
+class AgentBehaviorTest(unittest.TestCase):
+  """Tests for the AgentBehavior enum."""
 
   def test_enum_values(self):
-    self.assertEqual(types.AgentMode.AUTONOMOUS, "autonomous")
-    self.assertEqual(types.AgentMode.INTERACTIVE, "interactive")
+    self.assertEqual(types.AgentBehavior.AUTONOMOUS, "autonomous")
+    self.assertEqual(types.AgentBehavior.INTERACTIVE, "interactive")
+    self.assertEqual(types.AgentBehavior.MINIMAL, "minimal")
 
 
 class CapabilitiesConfigTest(unittest.TestCase):
@@ -673,18 +755,26 @@ class CapabilitiesConfigTest(unittest.TestCase):
     """Verifies defaults: subagents enabled, no tool lists, no threshold."""
     config = types.CapabilitiesConfig()
     self.assertTrue(config.enable_subagents)
-    self.assertEqual(config.agent_mode, types.AgentMode.AUTONOMOUS)
+    self.assertEqual(config.agent_behavior, types.AgentBehavior.AUTONOMOUS)
     self.assertIsNone(config.enabled_tools)
     self.assertIsNone(config.disabled_tools)
     self.assertIsNone(config.compaction_threshold)
     self.assertIsNone(config.finish_tool_schema_json)
 
-  def test_agent_mode_explicit(self):
-    """Verifies that agent_mode can be explicitly set via enum or string."""
-    config = types.CapabilitiesConfig(agent_mode=types.AgentMode.INTERACTIVE)
-    self.assertEqual(config.agent_mode, types.AgentMode.INTERACTIVE)
-    config_str = types.CapabilitiesConfig(agent_mode="interactive")
-    self.assertEqual(config_str.agent_mode, types.AgentMode.INTERACTIVE)
+  def test_agent_behavior_explicit(self):
+    """Verifies that agent_behavior can be explicitly set via enum or string."""
+    config = types.CapabilitiesConfig(
+        agent_behavior=types.AgentBehavior.INTERACTIVE
+    )
+    self.assertEqual(config.agent_behavior, types.AgentBehavior.INTERACTIVE)
+    config_str = types.CapabilitiesConfig(agent_behavior="interactive")
+    self.assertEqual(config_str.agent_behavior, types.AgentBehavior.INTERACTIVE)
+    config_min = types.CapabilitiesConfig(
+        agent_behavior=types.AgentBehavior.MINIMAL
+    )
+    self.assertEqual(config_min.agent_behavior, types.AgentBehavior.MINIMAL)
+    config_min_str = types.CapabilitiesConfig(agent_behavior="minimal")
+    self.assertEqual(config_min_str.agent_behavior, types.AgentBehavior.MINIMAL)
 
   def test_enabled_tools(self):
     """Verifies that enabled_tools accepts a list of BuiltinTools."""
@@ -712,17 +802,43 @@ class CapabilitiesConfigTest(unittest.TestCase):
           disabled_tools=[types.BuiltinTools.RUN_COMMAND],
       )
 
+  def test_default_instantiation_emits_no_deprecation_warning(self):
+    """Verifies default CapabilitiesConfig() emits no DeprecationWarning."""
+    with warnings.catch_warnings(record=True) as w:
+      warnings.simplefilter("always")
+      config = types.CapabilitiesConfig()
+      explicit_none_config = types.CapabilitiesConfig(compaction_threshold=None)
+      compaction_warnings = [
+          item
+          for item in w
+          if issubclass(item.category, DeprecationWarning)
+          and "compaction_threshold" in str(item.message)
+      ]
+      self.assertEqual(compaction_warnings, [])
+    self.assertIsNone(config._get_explicit_compaction_threshold())
+    self.assertIsNone(explicit_none_config._get_explicit_compaction_threshold())
+
   def test_compaction_threshold_explicit(self):
-    """Verifies that compaction_threshold accepts an explicit integer."""
-    config = types.CapabilitiesConfig(compaction_threshold=50000)
-    self.assertEqual(config.compaction_threshold, 50000)
+    """Verifies that compaction_threshold accepts an integer and emits DeprecationWarning."""
+    with warnings.catch_warnings(record=True) as w:
+      warnings.simplefilter("always")
+      config = types.CapabilitiesConfig(compaction_threshold=50000)
+      init_warnings = [
+          item
+          for item in w
+          if issubclass(item.category, DeprecationWarning)
+          and "CapabilitiesConfig.compaction_threshold is deprecated"
+          in str(item.message)
+      ]
+      self.assertEqual(len(init_warnings), 1)
+      self.assertEqual(config.compaction_threshold, 50000)
 
   def test_ask_question_warning_when_not_interactive(self):
     """Verifies warning when ASK_QUESTION is enabled and not interactive."""
     with self.assertLogs(level="WARNING") as log_cm:
       types.CapabilitiesConfig(
           enabled_tools=[types.BuiltinTools.ASK_QUESTION],
-          agent_mode=types.AgentMode.AUTONOMOUS,
+          agent_behavior=types.AgentBehavior.AUTONOMOUS,
       )
     self.assertTrue(
         any("ASK_QUESTION is enabled" in msg for msg in log_cm.output)
@@ -733,16 +849,148 @@ class CapabilitiesConfigTest(unittest.TestCase):
     with mock.patch("logging.warning") as mock_warn:
       types.CapabilitiesConfig(
           enabled_tools=[types.BuiltinTools.ASK_QUESTION],
-          agent_mode=types.AgentMode.INTERACTIVE,
+          agent_behavior=types.AgentBehavior.INTERACTIVE,
       )
       mock_warn.assert_not_called()
+
+  def test_max_subagent_depth_and_allowed_subagents(self):
+    """Verifies max_subagent_depth and allowed_subagents on CapabilitiesConfig."""
+    config = types.CapabilitiesConfig(
+        max_subagent_depth=3,
+        allowed_subagents=["researcher", "reviewer"],
+    )
+    self.assertEqual(config.max_subagent_depth, 3)
+    self.assertEqual(config.allowed_subagents, ["researcher", "reviewer"])
+
+  def test_max_subagent_depth_ge_1_enforced(self):
+    """Verifies max_subagent_depth < 1 raises ValidationError."""
+    with self.assertRaises(pydantic.ValidationError) as cm:
+      types.CapabilitiesConfig(max_subagent_depth=0)
+    self.assertIn("greater than or equal to 1", str(cm.exception))
+
+  def test_run_command_config_defaults_and_custom(self):
+    """Verifies RunCommandConfig defaults and custom settings on CapabilitiesConfig."""
+    config_default = types.CapabilitiesConfig()
+    self.assertIsNone(config_default.run_command_config)
+
+    run_cmd_default = types.RunCommandConfig()
+    self.assertFalse(run_cmd_default.enable_daemons)
+    self.assertIsNone(run_cmd_default.timeout_seconds)
+    self.assertFalse(run_cmd_default.enable_sandbox)
+
+    config_custom = types.CapabilitiesConfig(
+        run_command_config=types.RunCommandConfig(
+            enable_daemons=True,
+            timeout_seconds=600.0,
+            enable_sandbox=True,
+        )
+    )
+    self.assertIsNotNone(config_custom.run_command_config)
+    self.assertTrue(config_custom.run_command_config.enable_daemons)
+    self.assertEqual(config_custom.run_command_config.timeout_seconds, 600.0)
+    self.assertTrue(config_custom.run_command_config.enable_sandbox)
+
+    subagent_caps = types.SubagentCapabilities(
+        run_command_config=types.RunCommandConfig(timeout_seconds=30.0)
+    )
+    self.assertIsNotNone(subagent_caps.run_command_config)
+    self.assertEqual(subagent_caps.run_command_config.timeout_seconds, 30.0)
+
+  def test_run_command_config_non_positive_timeout_raises(self):
+    """Verifies timeout_seconds <= 0 raises ValidationError."""
+    with self.assertRaises(pydantic.ValidationError):
+      types.RunCommandConfig(timeout_seconds=0)
+
+    with self.assertRaises(pydantic.ValidationError):
+      types.RunCommandConfig(timeout_seconds=-10.0)
+
+  def test_subagent_capabilities_allowed_subagents(self):
+    """Verifies allowed_subagents on SubagentCapabilities."""
+    caps = types.SubagentCapabilities(allowed_subagents=["fact_checker"])
+    self.assertEqual(caps.allowed_subagents, ["fact_checker"])
+
+  def test_max_subagent_depth_fails_when_subagents_disabled(self):
+    """Verifies ValidationError when max_subagent_depth is set but subagents disabled."""
+    with self.assertRaises(pydantic.ValidationError) as cm:
+      types.CapabilitiesConfig(
+          enable_subagents=False,
+          max_subagent_depth=2,
+      )
+    self.assertIn("max_subagent_depth cannot be configured", str(cm.exception))
+
+  def test_max_subagent_depth_1_fails_when_subagents_disabled(self):
+    """Verifies max_subagent_depth=1 also fails when subagents disabled."""
+    with self.assertRaises(pydantic.ValidationError) as cm:
+      types.CapabilitiesConfig(
+          enable_subagents=False,
+          max_subagent_depth=1,
+      )
+    self.assertIn("max_subagent_depth cannot be configured", str(cm.exception))
+
+  def test_allowed_subagents_fails_when_subagents_disabled(self):
+    """Verifies ValidationError when allowed_subagents is set but subagents disabled."""
+    with self.assertRaises(pydantic.ValidationError) as cm:
+      types.CapabilitiesConfig(
+          enable_subagents=False,
+          allowed_subagents=["worker"],
+      )
+    self.assertIn("allowed_subagents cannot be specified", str(cm.exception))
+
+  def test_allowed_subagents_empty_list_fails_when_subagents_disabled(self):
+    """Verifies ValidationError when allowed_subagents=[] and subagents disabled."""
+    with self.assertRaises(pydantic.ValidationError) as cm:
+      types.CapabilitiesConfig(
+          enable_subagents=False,
+          allowed_subagents=[],
+      )
+    self.assertIn("allowed_subagents cannot be specified", str(cm.exception))
+
+  def test_max_subagent_depth_fails_when_start_subagent_tool_disabled(self):
+    """Verifies ValidationError when START_SUBAGENT is in disabled_tools."""
+    with self.assertRaises(pydantic.ValidationError) as cm:
+      types.CapabilitiesConfig(
+          disabled_tools=[types.BuiltinTools.START_SUBAGENT],
+          max_subagent_depth=3,
+      )
+    self.assertIn("max_subagent_depth cannot be configured", str(cm.exception))
+
+  def test_allowed_subagents_fails_when_start_subagent_tool_disabled(self):
+    """Verifies ValidationError when START_SUBAGENT is in disabled_tools and allowed_subagents is set."""
+    with self.assertRaises(pydantic.ValidationError) as cm:
+      types.CapabilitiesConfig(
+          disabled_tools=[types.BuiltinTools.START_SUBAGENT],
+          allowed_subagents=["worker"],
+      )
+    self.assertIn("allowed_subagents cannot be specified", str(cm.exception))
+
+  def test_max_subagent_depth_fails_when_start_subagent_not_in_enabled_tools(
+      self,
+  ):
+    """Verifies ValidationError when START_SUBAGENT is omitted from enabled_tools."""
+    with self.assertRaises(pydantic.ValidationError) as cm:
+      types.CapabilitiesConfig(
+          enabled_tools=[types.BuiltinTools.VIEW_FILE],
+          max_subagent_depth=2,
+      )
+    self.assertIn("max_subagent_depth cannot be configured", str(cm.exception))
+
+  def test_allowed_subagents_fails_when_start_subagent_not_in_enabled_tools(
+      self,
+  ):
+    """Verifies ValidationError when START_SUBAGENT is omitted from enabled_tools and allowed_subagents is set."""
+    with self.assertRaises(pydantic.ValidationError) as cm:
+      types.CapabilitiesConfig(
+          enabled_tools=[types.BuiltinTools.VIEW_FILE],
+          allowed_subagents=["worker"],
+      )
+    self.assertIn("allowed_subagents cannot be specified", str(cm.exception))
 
   def test_subagent_ask_question_warning_when_not_interactive(self):
     """Verifies that a warning is logged for SubagentCapabilities."""
     with self.assertLogs(level="WARNING") as log_cm:
       types.SubagentCapabilities(
           enabled_tools=[types.BuiltinTools.ASK_QUESTION],
-          agent_mode=types.AgentMode.AUTONOMOUS,
+          agent_behavior=types.AgentBehavior.AUTONOMOUS,
       )
     self.assertTrue(
         any(
@@ -750,6 +998,107 @@ class CapabilitiesConfigTest(unittest.TestCase):
             for msg in log_cm.output
         )
     )
+
+  def test_tool_output_truncation_config_default(self):
+    """Verifies default tool_output_truncation_config is None."""
+    config = types.CapabilitiesConfig()
+    self.assertIsNone(config.tool_output_truncation_config)
+
+  def test_tool_output_truncation_config_int_shorthand(self):
+    """Verifies int shorthand is coerced to ToolOutputTruncationConfig."""
+    config = types.CapabilitiesConfig(tool_output_truncation_config=2048)
+    self.assertEqual(
+        config.tool_output_truncation_config,
+        types.ToolOutputTruncationConfig(max_tokens=2048),
+    )
+
+  def test_tool_output_truncation_config_zero(self):
+    """Verifies 0 max_tokens is permitted to disable truncation."""
+    config = types.CapabilitiesConfig(tool_output_truncation_config=0)
+    self.assertEqual(
+        config.tool_output_truncation_config,
+        types.ToolOutputTruncationConfig(max_tokens=0),
+    )
+
+  def test_tool_output_truncation_config_instance(self):
+    """Verifies passing ToolOutputTruncationConfig instance."""
+    instance = types.ToolOutputTruncationConfig(max_tokens=1024)
+    config = types.CapabilitiesConfig(tool_output_truncation_config=instance)
+    self.assertIs(config.tool_output_truncation_config, instance)
+
+  def test_tool_output_truncation_config_dict(self):
+    """Verifies passing dict representation."""
+    config = types.CapabilitiesConfig(
+        tool_output_truncation_config={"max_tokens": 512}
+    )
+    self.assertEqual(
+        config.tool_output_truncation_config,
+        types.ToolOutputTruncationConfig(max_tokens=512),
+    )
+
+  def test_tool_output_truncation_config_boolean_rejected(self):
+    """Verifies boolean is rejected."""
+    with self.assertRaises(TypeError):
+      types.CapabilitiesConfig(tool_output_truncation_config=True)
+    with self.assertRaises(TypeError):
+      types.CapabilitiesConfig(tool_output_truncation_config=False)
+
+  def test_tool_output_truncation_config_invalid_types_rejected(self):
+    """Verifies non-int non-dict invalid types raise TypeError."""
+    with self.assertRaises(TypeError):
+      types.CapabilitiesConfig(tool_output_truncation_config="unlimited")
+
+  def test_tool_output_truncation_config_negative_or_overflow_raises(self):
+    """Verifies negative or overflowing int values raise ValidationError."""
+    with self.assertRaises(pydantic.ValidationError):
+      types.CapabilitiesConfig(tool_output_truncation_config=-1)
+    with self.assertRaises(pydantic.ValidationError):
+      types.CapabilitiesConfig(tool_output_truncation_config=2**31)
+
+
+class CompactionConfigTest(unittest.TestCase):
+  """Validates the CompactionConfig Pydantic model."""
+
+  def test_defaults(self):
+    """Verifies that CompactionConfig fields default to None."""
+    cfg = types.CompactionConfig()
+    self.assertIsNone(cfg.token_threshold)
+
+  def test_explicit_fields(self):
+    """Verifies construction with explicit integer limits."""
+    cfg = types.CompactionConfig(token_threshold=50000)
+    self.assertEqual(cfg.token_threshold, 50000)
+
+  def test_non_positive_values_raise(self):
+    """Verifies that values must be strictly greater than 0."""
+    with self.assertRaises(pydantic.ValidationError):
+      types.CompactionConfig(token_threshold=0)
+    with self.assertRaises(pydantic.ValidationError):
+      types.CompactionConfig(token_threshold=-1)
+
+
+class ToolOutputTruncationConfigTest(unittest.TestCase):
+  """Validates the ToolOutputTruncationConfig Pydantic model."""
+
+  def test_defaults(self):
+    """Verifies default values for ToolOutputTruncationConfig."""
+    cfg = types.ToolOutputTruncationConfig(max_tokens=2048)
+    self.assertEqual(cfg.max_tokens, 2048)
+
+  def test_zero_max_tokens_allowed(self):
+    """Verifies max_tokens=0 is permitted to explicitly disable truncation."""
+    cfg = types.ToolOutputTruncationConfig(max_tokens=0)
+    self.assertEqual(cfg.max_tokens, 0)
+
+  def test_negative_max_tokens_raises(self):
+    """Verifies validation error when max_tokens is negative."""
+    with self.assertRaises(pydantic.ValidationError):
+      types.ToolOutputTruncationConfig(max_tokens=-1)
+
+  def test_overflow_max_tokens_raises(self):
+    """Verifies validation error when max_tokens exceeds int32."""
+    with self.assertRaises(pydantic.ValidationError):
+      types.ToolOutputTruncationConfig(max_tokens=2**31)
 
 
 class AntigravityConnectionErrorTest(unittest.TestCase):
@@ -777,6 +1126,7 @@ class ToolExecutionErrorTest(unittest.TestCase):
     self.assertEqual(err.tool_name, "run_command")
     self.assertIsNone(err.server_name)
     self.assertIsNone(err.call_id)
+    self.assertIsNone(err.step_id)
 
   def test_explicit_server_name_and_call_id(self):
     """Verifies construction with explicit server_name and call_id."""
@@ -785,12 +1135,14 @@ class ToolExecutionErrorTest(unittest.TestCase):
         tool_name="mcp_tool",
         server_name="mcp_server",
         call_id="call_123",
+        step_id="step_456",
     )
     self.assertIsInstance(err, RuntimeError)
     self.assertEqual(str(err), "query failed")
     self.assertEqual(err.tool_name, "mcp_tool")
     self.assertEqual(err.server_name, "mcp_server")
     self.assertEqual(err.call_id, "call_123")
+    self.assertEqual(err.step_id, "step_456")
 
 
 class ImageTest(unittest.TestCase):
@@ -1005,6 +1357,31 @@ class ContentFromFileResolverTest(parameterized.TestCase):
       ):
         with self.assertRaisesRegex(OSError, "Failed to read file"):
           types.from_file(tmp_file)
+
+
+class ContentFromBytesResolverTest(parameterized.TestCase):
+  """Validates the global from_bytes content resolver helper function."""
+
+  @parameterized.named_parameters(
+      ("image", "image/png", types.Image),
+      ("document", "application/pdf", types.Document),
+      ("audio", "audio/mpeg", types.Audio),
+      ("video", "video/mp4", types.Video),
+  )
+  def test_resolves_from_bytes(self, mime_type, expected_class):
+    """Verifies that bytes and MIME type are resolved to the correct Content primitives."""
+    res = types.from_bytes(
+        b"fake_bytes", mime_type=mime_type, description="byte asset"
+    )
+    self.assertIsInstance(res, expected_class)
+    self.assertEqual(res.mime_type, mime_type)
+    self.assertEqual(res.description, "byte asset")
+    self.assertEqual(res.data, b"fake_bytes")
+
+  def test_unsupported_mime_type_raises_error(self):
+    """Verifies that an unsupported MIME type raises a descriptive ValueError."""
+    with self.assertRaisesRegex(ValueError, "Unsupported MIME type"):
+      types.from_bytes(b"data", mime_type="application/x-unsupported-custom")
 
 
 class ChatResponseStreamTest(unittest.IsolatedAsyncioTestCase):
@@ -1697,15 +2074,17 @@ class SubagentCapabilitiesTest(unittest.TestCase):
 
   def test_defaults(self):
     sc = types.SubagentCapabilities()
-    self.assertEqual(sc.agent_mode, types.AgentMode.AUTONOMOUS)
+    self.assertEqual(sc.agent_behavior, types.AgentBehavior.AUTONOMOUS)
     self.assertIsNone(sc.enabled_tools)
     self.assertIsNone(sc.disabled_tools)
 
-  def test_agent_mode_explicit(self):
-    sc = types.SubagentCapabilities(agent_mode=types.AgentMode.INTERACTIVE)
-    self.assertEqual(sc.agent_mode, types.AgentMode.INTERACTIVE)
-    sc_str = types.SubagentCapabilities(agent_mode="interactive")
-    self.assertEqual(sc_str.agent_mode, types.AgentMode.INTERACTIVE)
+  def test_agent_behavior_explicit(self):
+    sc = types.SubagentCapabilities(
+        agent_behavior=types.AgentBehavior.INTERACTIVE
+    )
+    self.assertEqual(sc.agent_behavior, types.AgentBehavior.INTERACTIVE)
+    sc_str = types.SubagentCapabilities(agent_behavior="interactive")
+    self.assertEqual(sc_str.agent_behavior, types.AgentBehavior.INTERACTIVE)
 
   def test_mutually_exclusive_ok_enabled(self):
     sc = types.SubagentCapabilities(
@@ -1726,6 +2105,33 @@ class SubagentCapabilitiesTest(unittest.TestCase):
       types.SubagentCapabilities(
           enabled_tools=[types.BuiltinTools.EDIT_FILE],
           disabled_tools=[types.BuiltinTools.RUN_COMMAND],
+      )
+
+  def test_allowed_subagents_valid_when_start_subagent_enabled(self):
+    sc = types.SubagentCapabilities(
+        enabled_tools=[types.BuiltinTools.START_SUBAGENT],
+        allowed_subagents=["worker"],
+    )
+    self.assertEqual(sc.allowed_subagents, ["worker"])
+
+  def test_allowed_subagents_raises_when_start_subagent_omitted_from_enabled_tools(
+      self,
+  ):
+    with self.assertRaisesRegex(
+        pydantic.ValidationError, "START_SUBAGENT is disabled or omitted"
+    ):
+      types.SubagentCapabilities(
+          enabled_tools=[types.BuiltinTools.VIEW_FILE],
+          allowed_subagents=["worker"],
+      )
+
+  def test_allowed_subagents_raises_when_start_subagent_in_disabled_tools(self):
+    with self.assertRaisesRegex(
+        pydantic.ValidationError, "START_SUBAGENT is disabled or omitted"
+    ):
+      types.SubagentCapabilities(
+          disabled_tools=[types.BuiltinTools.START_SUBAGENT],
+          allowed_subagents=["worker"],
       )
 
 
@@ -1771,6 +2177,23 @@ class SubagentConfigTest(unittest.TestCase):
 
     with self.assertRaises(pydantic.ValidationError):
       types.SubagentConfig(**{"description": "helpful agent"})  # Missing name
+
+  def test_model_configuration(self):
+    sub_str = types.SubagentConfig(
+        name="flash_helper",
+        description="helpful agent",
+        model="gemini-2.5-flash",
+    )
+    self.assertEqual(sub_str.model, "gemini-2.5-flash")
+
+    # Subagents pin a model name only; a ModelTarget could carry an endpoint
+    # that localharness cannot honor, so it is rejected outright.
+    with self.assertRaises(pydantic.ValidationError):
+      types.SubagentConfig(
+          name="pro_helper",
+          description="helpful agent",
+          model=types.ModelTarget(name="gemini-2.5-pro"),
+      )
 
 
 class UsageMetadataTest(unittest.TestCase):
@@ -1834,6 +2257,208 @@ class UsageMetadataTest(unittest.TestCase):
     u = types.UsageMetadata(prompt_token_count=10)
     self.assertEqual(u.__add__(1), NotImplemented)
 
+  def test_sub_operator(self):
+    """Verifies that __sub__ subtracts token usage fields correctly."""
+    u1 = types.UsageMetadata(
+        prompt_token_count=300,
+        cached_content_token_count=60,
+        candidates_token_count=70,
+        thoughts_token_count=25,
+        total_token_count=395,
+    )
+    u2 = types.UsageMetadata(
+        prompt_token_count=100,
+        cached_content_token_count=50,
+        candidates_token_count=30,
+        thoughts_token_count=20,
+        total_token_count=150,
+    )
+    res = u1 - u2
+    self.assertEqual(res.prompt_token_count, 200)
+    self.assertEqual(res.cached_content_token_count, 10)
+    self.assertEqual(res.candidates_token_count, 40)
+    self.assertEqual(res.thoughts_token_count, 5)
+    self.assertEqual(res.total_token_count, 245)
+
+  def test_sub_operator_with_none(self):
+    """Verifies that __sub__ treats None fields as zero."""
+    u1 = types.UsageMetadata(
+        prompt_token_count=100,
+    )
+    u2 = types.UsageMetadata(
+        candidates_token_count=50,
+    )
+    res = u1 - u2
+    self.assertEqual(res.prompt_token_count, 100)
+    self.assertEqual(res.cached_content_token_count, 0)
+    self.assertEqual(res.candidates_token_count, -50)
+    self.assertEqual(res.thoughts_token_count, 0)
+    self.assertEqual(res.total_token_count, 0)
+
+  def test_sub_operator_service_tier(self):
+    """Verifies that __sub__ preserves and resolves service_tier correctly."""
+    u_none = types.UsageMetadata()
+    u_std = types.UsageMetadata(service_tier=types.ServiceTier.STANDARD)
+    u_pri = types.UsageMetadata(service_tier=types.ServiceTier.PRIORITY)
+    u_flex = types.UsageMetadata(service_tier=types.ServiceTier.FLEX)
+
+    self.assertEqual((u_pri - u_pri).service_tier, types.ServiceTier.PRIORITY)
+    self.assertEqual((u_flex - u_flex).service_tier, types.ServiceTier.FLEX)
+    self.assertEqual((u_pri - u_none).service_tier, types.ServiceTier.PRIORITY)
+    self.assertEqual((u_none - u_flex).service_tier, types.ServiceTier.FLEX)
+    self.assertEqual((u_pri - u_flex).service_tier, types.ServiceTier.PRIORITY)
+    self.assertEqual((u_flex - u_pri).service_tier, types.ServiceTier.FLEX)
+    self.assertEqual((u_pri - u_std).service_tier, types.ServiceTier.PRIORITY)
+    self.assertIsNone((u_none - u_none).service_tier)
+
+  def test_sub_operator_invalid_type(self):
+    """Verifies that __sub__ returns NotImplemented for invalid types."""
+    u = types.UsageMetadata(prompt_token_count=10)
+    self.assertEqual(u.__sub__(1), NotImplemented)
+
+  def test_radd_operator(self):
+    """Verifies that __radd__ and 0 identity work as expected."""
+    u1 = types.UsageMetadata(
+        prompt_token_count=100,
+        cached_content_token_count=50,
+        candidates_token_count=30,
+        thoughts_token_count=20,
+        total_token_count=150,
+        service_tier=types.ServiceTier.PRIORITY,
+    )
+    u2 = types.UsageMetadata(
+        prompt_token_count=200,
+        cached_content_token_count=10,
+        candidates_token_count=40,
+        thoughts_token_count=5,
+        total_token_count=245,
+        service_tier=types.ServiceTier.PRIORITY,
+    )
+
+    # 0 + u1 == u1 and u1 + 0 == u1 (copy independence)
+    res_l = 0 + u1
+    self.assertEqual(res_l, u1)
+    self.assertIsNot(res_l, u1)
+
+    res_r = u1 + 0
+    self.assertEqual(res_r, u1)
+    self.assertIsNot(res_r, u1)
+
+    # sum([u1, u2]) and single-element sum([u1])
+    res_sum = sum([u1, u2])
+    self.assertEqual(res_sum, u1 + u2)
+    self.assertIsNot(res_sum, u1)
+    self.assertIsNot(res_sum, u2)
+
+    res_single = sum([u1])
+    self.assertEqual(res_single, u1)
+    self.assertIsNot(res_single, u1)
+
+    # Direct __radd__ call between UsageMetadata instances
+    self.assertEqual(u2.__radd__(u1), u1 + u2)
+
+    # Invalid types: direct dunder returns NotImplemented
+    self.assertEqual(u1.__radd__("invalid"), NotImplemented)
+
+    # Operator expressions raise TypeError for both left and right
+    # invalid operands.
+    with self.assertRaises(TypeError):
+      _ = False + u1
+    with self.assertRaises(TypeError):
+      _ = u1 + False
+    with self.assertRaises(TypeError):
+      _ = True + u1
+    with self.assertRaises(TypeError):
+      _ = u1 + True
+    with self.assertRaises(TypeError):
+      _ = "invalid" + u1
+    with self.assertRaises(TypeError):
+      _ = u1 + "invalid"
+
+  def test_mul_operator(self):
+    """Verifies that scalar multiplication scales token counts correctly."""
+    u = types.UsageMetadata(
+        prompt_token_count=100,
+        cached_content_token_count=50,
+        candidates_token_count=31,
+        thoughts_token_count=21,
+        total_token_count=152,
+        service_tier=types.ServiceTier.PRIORITY,
+    )
+
+    # Integer scaling
+    u2 = u * 2
+    self.assertEqual(u2.prompt_token_count, 200)
+    self.assertEqual(u2.cached_content_token_count, 100)
+    self.assertEqual(u2.candidates_token_count, 62)
+    self.assertEqual(u2.thoughts_token_count, 42)
+    self.assertEqual(u2.total_token_count, 304)
+    self.assertEqual(u2.service_tier, types.ServiceTier.PRIORITY)
+
+    # Float scaling with explicit rounded integer values (round-half-to-even)
+    u_float = u * 1.5
+    self.assertEqual(u_float.prompt_token_count, 150)
+    self.assertEqual(u_float.cached_content_token_count, 75)
+    self.assertEqual(u_float.candidates_token_count, 46)
+    self.assertEqual(u_float.thoughts_token_count, 32)
+    self.assertEqual(u_float.total_token_count, 228)
+    self.assertEqual(u_float.service_tier, types.ServiceTier.PRIORITY)
+
+    # Zero scaling
+    u0 = u * 0
+    self.assertEqual(u0.prompt_token_count, 0)
+    self.assertEqual(u0.cached_content_token_count, 0)
+    self.assertEqual(u0.candidates_token_count, 0)
+    self.assertEqual(u0.thoughts_token_count, 0)
+    self.assertEqual(u0.total_token_count, 0)
+    self.assertEqual(u0.service_tier, types.ServiceTier.PRIORITY)
+
+    # None field preservation
+    u_none = types.UsageMetadata(prompt_token_count=100)
+    u_none_scaled = u_none * 2
+    self.assertEqual(u_none_scaled.prompt_token_count, 200)
+    self.assertIsNone(u_none_scaled.cached_content_token_count)
+    self.assertIsNone(u_none_scaled.candidates_token_count)
+    self.assertIsNone(u_none_scaled.thoughts_token_count)
+    self.assertIsNone(u_none_scaled.total_token_count)
+    self.assertIsNone(u_none_scaled.service_tier)
+
+    # Commutativity
+    self.assertEqual(3 * u, u * 3)
+
+    # Invalid types: direct dunder returns NotImplemented
+    self.assertEqual(u.__mul__("invalid"), NotImplemented)
+    self.assertEqual(u.__mul__(False), NotImplemented)
+    self.assertEqual(u.__mul__(True), NotImplemented)
+
+    # Operator expressions raise TypeError
+    with self.assertRaises(TypeError):
+      _ = u * False
+    with self.assertRaises(TypeError):
+      _ = False * u
+    with self.assertRaises(TypeError):
+      _ = u * True
+    with self.assertRaises(TypeError):
+      _ = True * u
+    with self.assertRaises(TypeError):
+      _ = u * "invalid"
+    with self.assertRaises(TypeError):
+      _ = "invalid" * u
+
+    # Invalid numbers: negative and non-finite raise ValueError
+    with self.assertRaises(ValueError):
+      _ = u * -1
+    with self.assertRaises(ValueError):
+      _ = -1 * u
+    with self.assertRaises(ValueError):
+      _ = u * float("nan")
+    with self.assertRaises(ValueError):
+      _ = float("nan") * u
+    with self.assertRaises(ValueError):
+      _ = u * float("inf")
+    with self.assertRaises(ValueError):
+      _ = float("inf") * u
+
 
 class RetryConfigTest(unittest.TestCase):
   """Tests for RetryConfig presets and explicit configuration."""
@@ -1862,6 +2487,168 @@ class RetryConfigTest(unittest.TestCase):
       types.ModelOutputRetryConfig(max_retries=-5)
     with self.assertRaises(pydantic.ValidationError):
       types.ModelOutputRetryConfig(max_retries=2**32)
+
+
+class BudgetEnforcementTypesTest(absltest.TestCase):
+  """Tests for StopReason."""
+
+  def test_budget_config_defaults_and_validation(self):
+    cfg = types.BudgetConfig()
+    self.assertIsNone(cfg.max_model_calls)
+    self.assertIsNone(cfg.max_tool_calls)
+    self.assertIsNone(cfg.max_input_tokens)
+    self.assertIsNone(cfg.max_output_tokens)
+    self.assertIsNone(cfg.max_total_tokens)
+    self.assertEqual(cfg.scope, types.BudgetScope.LIFETIME)
+
+    cfg_valid = types.BudgetConfig(
+        max_model_calls=5,
+        max_tool_calls=10,
+        max_input_tokens=500,
+        max_output_tokens=200,
+        max_total_tokens=1000,
+        scope=types.BudgetScope.FORWARD_LOOKING,
+    )
+    self.assertEqual(cfg_valid.max_model_calls, 5)
+    self.assertEqual(cfg_valid.max_tool_calls, 10)
+    self.assertEqual(cfg_valid.max_input_tokens, 500)
+    self.assertEqual(cfg_valid.max_output_tokens, 200)
+    self.assertEqual(cfg_valid.max_total_tokens, 1000)
+    self.assertEqual(cfg_valid.scope, types.BudgetScope.FORWARD_LOOKING)
+
+    with self.assertRaises(pydantic.ValidationError):
+      types.BudgetConfig(max_model_calls=0)
+    with self.assertRaises(pydantic.ValidationError):
+      types.BudgetConfig(max_model_calls=2**31)
+    with self.assertRaises(pydantic.ValidationError):
+      types.BudgetConfig(max_tool_calls=0)
+    with self.assertRaises(pydantic.ValidationError):
+      types.BudgetConfig(max_tool_calls=2**31)
+    with self.assertRaises(pydantic.ValidationError):
+      types.BudgetConfig(max_input_tokens=0)
+    with self.assertRaises(pydantic.ValidationError):
+      types.BudgetConfig(max_input_tokens=2**63)
+    with self.assertRaises(pydantic.ValidationError):
+      types.BudgetConfig(max_output_tokens=0)
+    with self.assertRaises(pydantic.ValidationError):
+      types.BudgetConfig(max_output_tokens=2**63)
+    with self.assertRaises(pydantic.ValidationError):
+      types.BudgetConfig(max_total_tokens=0)
+    with self.assertRaises(pydantic.ValidationError):
+      types.BudgetConfig(max_total_tokens=2**63)
+    with self.assertRaises(pydantic.ValidationError):
+      types.BudgetConfig.model_validate({"scope": "INVALID_SCOPE"})
+
+  def test_budget_scope_enum(self):
+    self.assertEqual(types.BudgetScope.LIFETIME, "LIFETIME")
+    self.assertEqual(types.BudgetScope.FORWARD_LOOKING, "FORWARD_LOOKING")
+
+  def test_stop_reason_enum(self):
+    self.assertEqual(types.StopReason.UNSPECIFIED, "UNSPECIFIED")
+    self.assertEqual(
+        types.StopReason.MAX_MODEL_CALLS_EXCEEDED,
+        "MAX_MODEL_CALLS_EXCEEDED",
+    )
+    self.assertEqual(
+        types.StopReason.MAX_TOOL_CALLS_EXCEEDED,
+        "MAX_TOOL_CALLS_EXCEEDED",
+    )
+    self.assertEqual(
+        types.StopReason.MAX_INPUT_TOKENS_EXCEEDED,
+        "MAX_INPUT_TOKENS_EXCEEDED",
+    )
+    self.assertEqual(
+        types.StopReason.MAX_OUTPUT_TOKENS_EXCEEDED,
+        "MAX_OUTPUT_TOKENS_EXCEEDED",
+    )
+    self.assertEqual(
+        types.StopReason.MAX_TOTAL_TOKENS_EXCEEDED,
+        "MAX_TOTAL_TOKENS_EXCEEDED",
+    )
+    self.assertEqual(types.StopReason.QUOTA_EXHAUSTED, "QUOTA_EXHAUSTED")
+
+  def test_chat_response_stop_reason(self):
+    async def mock_stream():
+      yield types.Text(step_index=1, text="")
+
+    mock_conv = mock.MagicMock(spec=conversation.Conversation)
+    mock_conv._last_turn_stop_reason = types.StopReason.QUOTA_EXHAUSTED
+    response = types.ChatResponse(mock_stream(), conversation=mock_conv)
+    self.assertEqual(
+        response.stop_reason,
+        types.StopReason.QUOTA_EXHAUSTED,
+    )
+
+
+class StopHookTypesTest(absltest.TestCase):
+  """Tests for StopDecision, StopHookResult, and StopArgs."""
+
+  def test_stop_decision_enum(self):
+    self.assertEqual(types.StopDecision.ALLOW_STOP, "ALLOW_STOP")
+    self.assertEqual(types.StopDecision.CONTINUE, "CONTINUE")
+
+  def test_stop_hook_result_defaults(self):
+    res = types.StopHookResult()
+    self.assertEqual(res.decision, types.StopDecision.ALLOW_STOP)
+    self.assertEqual(res.reason, "")
+
+  def test_stop_hook_result_custom(self):
+    res = types.StopHookResult(
+        decision=types.StopDecision.CONTINUE,
+        reason="Needs revision",
+    )
+    self.assertEqual(res.decision, types.StopDecision.CONTINUE)
+    self.assertEqual(res.reason, "Needs revision")
+
+  def test_stop_hook_result_extra_fields_ignored(self):
+    res = types.StopHookResult.model_validate(
+        {"decision": "CONTINUE", "reason": "more work", "extra_field": 123}
+    )
+    self.assertEqual(res.decision, types.StopDecision.CONTINUE)
+    self.assertEqual(res.reason, "more work")
+
+  def test_stop_hook_result_continue_requires_non_empty_reason(self):
+    with self.assertRaisesRegex(ValueError, "requires a non-empty reason"):
+      types.StopHookResult(decision=types.StopDecision.CONTINUE)
+
+    with self.assertRaisesRegex(ValueError, "requires a non-empty reason"):
+      types.StopHookResult(decision=types.StopDecision.CONTINUE, reason="")
+
+    with self.assertRaisesRegex(ValueError, "requires a non-empty reason"):
+      types.StopHookResult(decision=types.StopDecision.CONTINUE, reason="   ")
+
+  def test_stop_args_defaults(self):
+    args = types.StopArgs()
+    self.assertEqual(args.response_text, "")
+    self.assertEqual(args.trajectory_id, "")
+    self.assertEqual(args.continuation_count, 0)
+    self.assertEqual(args.stop_reason, types.StopReason.UNSPECIFIED)
+    self.assertEqual(args.error_message, "")
+
+  def test_stop_args_custom(self):
+    args = types.StopArgs(
+        response_text="All done",
+        trajectory_id="traj_123",
+        continuation_count=2,
+        stop_reason=types.StopReason.MAX_MODEL_CALLS_EXCEEDED,
+        error_message="budget reached",
+    )
+    self.assertEqual(args.response_text, "All done")
+    self.assertEqual(args.trajectory_id, "traj_123")
+    self.assertEqual(args.continuation_count, 2)
+    self.assertEqual(
+        args.stop_reason, types.StopReason.MAX_MODEL_CALLS_EXCEEDED
+    )
+    self.assertEqual(args.error_message, "budget reached")
+
+  def test_stop_args_string_coercion_and_extra_ignored(self):
+    args = types.StopArgs.model_validate({
+        "response_text": "done",
+        "stop_reason": "QUOTA_EXHAUSTED",
+        "unknown_wire_field": "ignore_me",
+    })
+    self.assertEqual(args.response_text, "done")
+    self.assertEqual(args.stop_reason, types.StopReason.QUOTA_EXHAUSTED)
 
 
 if __name__ == "__main__":

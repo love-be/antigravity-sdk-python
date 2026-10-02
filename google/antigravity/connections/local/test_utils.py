@@ -29,6 +29,8 @@ from google.antigravity.tools import tool_runner
 class TestWebSocket:
   """Mock WebSocket allowing async injection and inspection of messages."""
 
+  __test__ = False
+
   def __init__(self):
     self.queue = asyncio.Queue()
     self.sent_messages = []
@@ -65,6 +67,8 @@ class TestLocalHarness:
   - 'wait_for_response' allows the test to wait for and inspect messages
     sent BY the Python SDK back to the Go harness.
   """
+
+  __test__ = False
 
   def __init__(
       self,
@@ -133,3 +137,39 @@ class TestLocalHarness:
         )
     )
     await self.send_event(event)
+
+
+def patch_default_binary_path(
+    test_case: unittest.TestCase,
+    return_value: str = "/fake/binary",
+) -> mock.MagicMock:
+  """Patches _get_default_binary_path for the lifetime of test_case.
+
+  Why this is needed:
+  The LocalConnectionStrategy.__init__ eagerly resolves the localharness binary
+  path by calling `_get_default_binary_path()`. In installed wheel distributions
+  or runtime environments, the binary is discovered from package resources,
+  `ANTIGRAVITY_HARNESS_PATH`, or `PATH`. However, in a clean git checkout of the
+  source tree, the binary is not checked into version control.
+
+  Unit tests that instantiate LocalAgentConfig, LocalConnectionStrategy,
+  LiteRTConnectionStrategy, or LocalOpenAIConnectionStrategy to test config
+  translation, proto builders, or loopback proxies do not execute the binary
+  subprocess. Calling this helper in test setUp() prevents `RuntimeError: Could
+  not find default localharness binary` on clean checkouts.
+
+  Args:
+    test_case: The TestCase instance to attach cleanup handlers to.
+    return_value: The mock binary path string to return.
+
+  Returns:
+    The started MagicMock object returned by mock.patch.
+  """
+  patcher = mock.patch.object(
+      local_connection,
+      "_get_default_binary_path",
+      return_value=return_value,
+  )
+  mocked = patcher.start()
+  test_case.addCleanup(patcher.stop)
+  return mocked

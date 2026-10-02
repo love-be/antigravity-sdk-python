@@ -47,13 +47,15 @@ class Conversation:
       max_history_size: int = _DEFAULT_MAX_HISTORY_SIZE,
       history: Sequence[types.Step] | None = None,
   ):
-    """Initializes the conversation with a connection and empty history.
+    """Initializes the conversation with a connection and optional initial history.
 
     Args:
       conn: The established connection to the agent backend.
       max_history_size: Maximum number of steps to retain in history.
         When exceeded, the oldest steps are discarded. Set to 0 to
         disable the limit.
+      history: Optional initial sequence of steps to seed the conversation
+        history.
     """
     self._connection = conn
     self._steps: list[types.Step] = []
@@ -154,7 +156,11 @@ class Conversation:
       is_model = step.source == types.StepSource.MODEL
       is_target_user = step.target == types.StepTarget.USER
 
-      if is_model and is_target_user:
+      if (
+          is_model
+          and is_target_user
+          and step.status != types.StepStatus.ERROR
+      ):
         # Yield real-time thought deltas directly
         if step.thinking_delta:
           yield types.Thought(
@@ -292,6 +298,11 @@ class Conversation:
     return self._connection.conversation_id
 
   @property
+  def sandbox_status(self) -> types.SandboxStatus | None:
+    """Returns the OS command sandbox status reported at handshake, if any."""
+    return self._connection.sandbox_status
+
+  @property
   def total_usage(self) -> types.UsageMetadata:
     """Returns cumulative token usage across all turns in this session."""
     return self._connection.cumulative_usage.model_copy()
@@ -321,6 +332,11 @@ class Conversation:
   def _last_turn_usage(self) -> types.UsageMetadata | None:
     """Internal alias for last_turn_usage."""
     return self.last_turn_usage
+
+  @property
+  def _last_turn_stop_reason(self) -> types.StopReason:
+    """Returns the stop reason of the most recent turn."""
+    return self._connection._last_turn_stop_reason  # pylint: disable=protected-access
 
   # ---------------------------------------------------------------------------
   # Lifecycle

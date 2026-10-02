@@ -14,19 +14,54 @@
 
 """Tests for event_processor that translates wire events to SDK events."""
 
+import asyncio
+import json
+from typing import Any
 import unittest
 from unittest import mock
 
 from absl.testing import absltest
 from google.protobuf import json_format
+import pydantic
 
+from google.antigravity.proto import content_pb2
 from google.antigravity.proto import localharness_pb2
 from google.antigravity import types
 from google.antigravity.connections.local import event_processor
+from google.antigravity.connections.local import types as local_types
+from google.antigravity.hooks import policy
 
 
 MAIN_TRAJECTORY_ID = "cbb3a5135a32671ae8152a25a857c4bc"
 SUBAGENT_TRAJECTORY_ID = "9121f3e9937e263b74a4a43ff6fb0117"
+
+
+class ParseInitializeResponseTest(absltest.TestCase):
+  """Tests for event_processor.parse_initialize_response sandbox parsing."""
+
+  def test_parses_available_sandbox_status(self):
+    resp = localharness_pb2.InitializeConversationResponse()
+    resp.sandbox_status.available = True
+    result = event_processor.parse_initialize_response(resp)
+    self.assertIsNotNone(result.sandbox_status)
+    self.assertTrue(result.sandbox_status.available)
+    self.assertIsNone(result.sandbox_status.unavailable_reason)
+
+  def test_parses_unavailable_sandbox_status(self):
+    resp = localharness_pb2.InitializeConversationResponse()
+    resp.sandbox_status.available = False
+    resp.sandbox_status.unavailable_reason = "android: VM boundary"
+    result = event_processor.parse_initialize_response(resp)
+    self.assertIsNotNone(result.sandbox_status)
+    self.assertFalse(result.sandbox_status.available)
+    self.assertEqual(
+        result.sandbox_status.unavailable_reason, "android: VM boundary"
+    )
+
+  def test_sandbox_status_none_when_unset(self):
+    resp = localharness_pb2.InitializeConversationResponse()
+    result = event_processor.parse_initialize_response(resp)
+    self.assertIsNone(result.sandbox_status)
 
 
 class EventProcessorHelperTest(absltest.TestCase):
@@ -84,6 +119,62 @@ class EventProcessorHelperTest(absltest.TestCase):
     self.assertIsNone(meta.thoughts_token_count)
     self.assertIsNone(meta.total_token_count)
     self.assertIsNone(meta.service_tier)
+
+  def test_parse_usage_metadata_unknown_service_tier_is_dropped(self):
+    # Vertex AI reports tiers the Gemini Developer API does not define. Raising
+    # here escapes the websocket reader loop and kills a turn whose response has
+    # already been delivered, so the tier is dropped and the counts survive.
+    pb = localharness_pb2.UsageMetadata(
+        total_token_count=250,
+        service_tier="PROVISIONED_THROUGHPUT",
+    )
+    meta = event_processor.parse_usage_metadata(pb)
+    self.assertIsNone(meta.service_tier)
+    self.assertEqual(meta.total_token_count, 250)
+
+  def test_parse_stop_reason(self):
+    self.assertEqual(
+        event_processor._parse_stop_reason(  # pylint: disable=protected-access
+            localharness_pb2.TrajectoryStateUpdate.STOP_REASON_MAX_MODEL_CALLS_EXCEEDED
+        ),
+        types.StopReason.MAX_MODEL_CALLS_EXCEEDED,
+    )
+    self.assertEqual(
+        event_processor._parse_stop_reason(  # pylint: disable=protected-access
+            localharness_pb2.TrajectoryStateUpdate.STOP_REASON_MAX_TOOL_CALLS_EXCEEDED
+        ),
+        types.StopReason.MAX_TOOL_CALLS_EXCEEDED,
+    )
+    self.assertEqual(
+        event_processor._parse_stop_reason(  # pylint: disable=protected-access
+            localharness_pb2.TrajectoryStateUpdate.STOP_REASON_MAX_INPUT_TOKENS_EXCEEDED
+        ),
+        types.StopReason.MAX_INPUT_TOKENS_EXCEEDED,
+    )
+    self.assertEqual(
+        event_processor._parse_stop_reason(  # pylint: disable=protected-access
+            localharness_pb2.TrajectoryStateUpdate.STOP_REASON_MAX_OUTPUT_TOKENS_EXCEEDED
+        ),
+        types.StopReason.MAX_OUTPUT_TOKENS_EXCEEDED,
+    )
+    self.assertEqual(
+        event_processor._parse_stop_reason(  # pylint: disable=protected-access
+            localharness_pb2.TrajectoryStateUpdate.STOP_REASON_MAX_TOTAL_TOKENS_EXCEEDED
+        ),
+        types.StopReason.MAX_TOTAL_TOKENS_EXCEEDED,
+    )
+    self.assertEqual(
+        event_processor._parse_stop_reason(  # pylint: disable=protected-access
+            localharness_pb2.TrajectoryStateUpdate.STOP_REASON_QUOTA_EXHAUSTED
+        ),
+        types.StopReason.QUOTA_EXHAUSTED,
+    )
+    self.assertEqual(
+        event_processor._parse_stop_reason(  # pylint: disable=protected-access
+            localharness_pb2.TrajectoryStateUpdate.STOP_REASON_UNSPECIFIED
+        ),
+        types.StopReason.UNSPECIFIED,
+    )
 
 
 class LocalConnectionStepFromDictTest(absltest.TestCase):
@@ -184,7 +275,52 @@ class LocalConnectionStepFromDictTest(absltest.TestCase):
     self.assertLen(step.tool_calls, 1)
     self.assertEqual(step.tool_calls[0].name, "view_file")
     self.assertEqual(step.tool_calls[0].args, {"file_path": "/foo"})
+    self.assertEqual(step.tool_calls[0].step_id, "0")
     self.assertEqual(step.tool_calls[0].canonical_path, "/foo")
+
+  def test_step_type_tool_call_with_generate_image_normalizes_output_path(self):
+    """Verifies that a step with generate_image built-in tool normalizes output_path."""
+    step = event_processor.LocalConnectionStep.from_dict({
+        "source": "SOURCE_MODEL",
+        "state": "STATE_DONE",
+        "generate_image": {
+            "prompt": "A sunset",
+            "image_name": "sunset",
+            "aspect_ratio": "16:9",
+            "output_path": "file:///tmp/sunset_123.png",
+        },
+    })
+    self.assertEqual(step.type, types.StepType.TOOL_CALL)
+    self.assertLen(step.tool_calls, 1)
+    self.assertEqual(step.tool_calls[0].name, "generate_image")
+    self.assertEqual(
+        step.tool_calls[0].args,
+        {
+            "prompt": "A sunset",
+            "image_name": "sunset",
+            "aspect_ratio": "16:9",
+            "output_path": "/tmp/sunset_123.png",
+        },
+    )
+    self.assertEqual(step.tool_calls[0].canonical_path, "/tmp/sunset_123.png")
+
+  def test_generate_image_result_model_output_path(self):
+    """Verifies GenerateImageResult field and string output formatting."""
+    res = local_types.GenerateImageResult(
+        image_name="sunset",
+        aspect_ratio="16:9",
+        output_path="/tmp/sunset_123.png",
+    )
+    self.assertEqual(res.image_name, "sunset")
+    self.assertEqual(res.aspect_ratio, "16:9")
+    self.assertEqual(res.output_path, "/tmp/sunset_123.png")
+    self.assertEqual(str(res), "/tmp/sunset_123.png")
+
+  def test_generate_image_result_model_fallback_str(self):
+    res = local_types.GenerateImageResult(
+        image_name="sunset", aspect_ratio="16:9"
+    )
+    self.assertEqual(str(res), "sunset")
 
   def test_structured_output_extracted_from_finish(self):
     """Verifies that structured output is extracted when finish payload is present.
@@ -267,6 +403,23 @@ class LocalConnectionStepFromDictTest(absltest.TestCase):
         "/cns/el-d/home/user/workspace/kittens.md",
     )
 
+  def test_step_from_dict_parses_parent_trajectory_id_and_depth(self):
+    """Verifies that from_dict parses parent_trajectory_id and depth."""
+    step = event_processor.LocalConnectionStep.from_dict({
+        "step_index": 5,
+        "trajectory_id": "child_traj_123",
+        "parent_trajectory_id": "parent_traj_456",
+        "depth": 2,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "text": "Task finished",
+    })
+    self.assertEqual(step.step_index, 5)
+    self.assertEqual(step.trajectory_id, "child_traj_123")
+    self.assertEqual(step.parent_trajectory_id, "parent_traj_456")
+    self.assertEqual(step.depth, 2)
+    self.assertEqual(step.content, "Task finished")
+
   def test_step_type_tool_call_with_custom_tool(self):
     """Verifies that a step with a custom_tool field is typed TOOL_CALL and parses details."""
     step = event_processor.LocalConnectionStep.from_dict({
@@ -313,6 +466,38 @@ class LocalConnectionStepFromDictTest(absltest.TestCase):
     })
     self.assertLen(step.tool_calls, 1)
     self.assertEqual(step.tool_calls[0].id, "traj_123:5")
+
+  def test_step_from_dict_failed_tool_call_preserves_tool_and_error_message(
+      self,
+  ):
+    """Verifies failed built-in tool steps preserve TOOL_CALL type and top-level error_message."""
+    step = event_processor.LocalConnectionStep.from_dict({
+        "trajectory_id": "traj_123",
+        "step_index": 2,
+        "source": "SOURCE_MODEL",
+        "target": "TARGET_ENVIRONMENT",
+        "state": "STATE_ERROR",
+        "text": "View missing.txt",
+        "text_delta": "",
+        "error_message": (
+            "Cannot view file file:///tmp/missing.txt which does not exist."
+        ),
+        "view_file": {
+            "file_path": "file:///tmp/missing.txt",
+            "start_line": 0,
+            "end_line": 799,
+        },
+    })
+    self.assertEqual(step.type, types.StepType.TOOL_CALL)
+    self.assertEqual(step.status, types.StepStatus.ERROR)
+    self.assertEqual(step.target, types.StepTarget.ENVIRONMENT)
+    self.assertLen(step.tool_calls, 1)
+    self.assertEqual(step.tool_calls[0].name, "view_file")
+    self.assertEqual(step.tool_calls[0].canonical_path, "/tmp/missing.txt")
+    self.assertEqual(
+        step.error,
+        "Cannot view file file:///tmp/missing.txt which does not exist.",
+    )
 
 
 class LocalHarnessEventProcessorTest(unittest.IsolatedAsyncioTestCase):
@@ -403,6 +588,32 @@ class LocalHarnessEventProcessorTest(unittest.IsolatedAsyncioTestCase):
     await processor.process_event(event)
 
     self.assertFalse(processor.is_idle.is_set())
+
+  async def test_process_event_updates_stop_reason(self):
+    processor = event_processor.LocalHarnessEventProcessor(
+        send_input_event_fn=mock.AsyncMock()
+    )
+    processor.main_trajectory_id = MAIN_TRAJECTORY_ID
+
+    event = localharness_pb2.OutputEvent(
+        trajectory_state_update=localharness_pb2.TrajectoryStateUpdate(
+            state=localharness_pb2.TrajectoryStateUpdate.State.STATE_FULLY_IDLE,
+            trajectory_id=MAIN_TRAJECTORY_ID,
+            stop_reason=localharness_pb2.TrajectoryStateUpdate.STOP_REASON_QUOTA_EXHAUSTED,
+        )
+    )
+    await processor.process_event(event)
+
+    self.assertEqual(
+        processor._last_turn_stop_reason,
+        types.StopReason.QUOTA_EXHAUSTED,
+    )
+
+    processor.reset_for_turn()
+    self.assertEqual(
+        processor._last_turn_stop_reason,
+        types.StopReason.UNSPECIFIED,
+    )
 
   async def test_main_agent_idle_sets_idle_state(self):
     """Verifies that when the main agent is IDLE, the connection is idle."""
@@ -610,10 +821,109 @@ class LocalHarnessEventProcessorTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(step.tool_calls[0].name, "my_remote_tool")
     self.assertEqual(step.type, types.StepType.TOOL_CALL)
 
-import asyncio
-import json
+  async def test_send_tool_results_with_proto_extensions_dict(self):
+    """Verifies _send_tool_results handles ToolResult containing dict with proto extensions."""
+    send_mock = mock.AsyncMock()
+    processor = event_processor.LocalHarnessEventProcessor(
+        send_input_event_fn=send_mock
+    )
+    video = content_pb2.VideoContent(
+        mime_type=content_pb2.VideoContent.TYPE_MP4,
+        uri="https://example.com/video/123",
+    )
+    tool_result = types.ToolResult(
+        id="call_123",
+        name="test_tool",
+        result={"output": "done", "video": video},
+    )
+    await processor._send_tool_results([tool_result])
 
-from google.antigravity.hooks import policy
+    send_mock.assert_called_once()
+    input_event = send_mock.call_args[0][0]
+    resp = input_event.tool_response
+    self.assertEqual(resp.id, "call_123")
+    self.assertTrue(resp.HasField("response"))
+    fields_map = {f.name: f.value for f in resp.response.fields}
+    self.assertEqual(fields_map["output"].string_value, "done")
+    self.assertEqual(
+        fields_map["video"].content_value.video.uri,
+        "https://example.com/video/123",
+    )
+    self.assertEqual(
+        json.loads(resp.response_json)["video"],
+        {"$ref": "https://example.com/video/123"},
+    )
+
+  async def test_send_tool_results_with_proto_extensions_non_dict(self):
+    """Verifies _send_tool_results handles ToolResult containing non-dict with proto extensions."""
+    send_mock = mock.AsyncMock()
+    processor = event_processor.LocalHarnessEventProcessor(
+        send_input_event_fn=send_mock
+    )
+    video = content_pb2.VideoContent(
+        mime_type=content_pb2.VideoContent.TYPE_MP4,
+        uri="https://example.com/video/123",
+    )
+    tool_result = types.ToolResult(
+        id="call_456",
+        name="test_tool",
+        result=video,
+    )
+    await processor._send_tool_results([tool_result])
+
+    send_mock.assert_called_once()
+    input_event = send_mock.call_args[0][0]
+    resp = input_event.tool_response
+    self.assertEqual(resp.id, "call_456")
+    self.assertTrue(resp.HasField("response"))
+    fields_map = {f.name: f.value for f in resp.response.fields}
+    self.assertEqual(
+        fields_map["result"].content_value.video.uri,
+        "https://example.com/video/123",
+    )
+    self.assertEqual(
+        json.loads(resp.response_json)["result"],
+        {"$ref": "https://example.com/video/123"},
+    )
+
+  async def test_send_tool_results_with_proto_extensions_pydantic_model(self):
+    """Verifies _send_tool_results handles ToolResult containing Pydantic model with proto extensions without wrapping."""
+
+    class ToolOutput(pydantic.BaseModel):
+      model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
+      output: str
+      video: Any
+
+    send_mock = mock.AsyncMock()
+    processor = event_processor.LocalHarnessEventProcessor(
+        send_input_event_fn=send_mock
+    )
+    video = content_pb2.VideoContent(
+        mime_type=content_pb2.VideoContent.TYPE_MP4,
+        uri="https://example.com/video/123",
+    )
+    tool_result = types.ToolResult(
+        id="call_789",
+        name="test_tool",
+        result=ToolOutput(output="done", video=video),
+    )
+    await processor._send_tool_results([tool_result])
+
+    send_mock.assert_called_once()
+    input_event = send_mock.call_args[0][0]
+    resp = input_event.tool_response
+    self.assertEqual(resp.id, "call_789")
+    self.assertTrue(resp.HasField("response"))
+    fields_map = {f.name: f.value for f in resp.response.fields}
+    self.assertEqual(fields_map["output"].string_value, "done")
+    self.assertEqual(
+        fields_map["video"].content_value.video.uri,
+        "https://example.com/video/123",
+    )
+    self.assertEqual(
+        json.loads(resp.response_json)["video"],
+        {"$ref": "https://example.com/video/123"},
+    )
 
 
 def _make_policy_decision_request(
@@ -622,11 +932,13 @@ def _make_policy_decision_request(
     tool_name: str = "run_command",
     arguments_json: str = "{}",
     server_name: str = "",
+    reason: str = "",
 ) -> localharness_pb2.OutputEvent:
   return localharness_pb2.OutputEvent(
       policy_decision_request=localharness_pb2.PolicyDecisionRequest(
           request_id=request_id,
           rule_id=rule_id,
+          reason=reason,
           tool_args=localharness_pb2.PreToolArgs(
               tool_name=tool_name,
               arguments_json=arguments_json,
@@ -711,6 +1023,54 @@ class PolicyDecisionTest(unittest.IsolatedAsyncioTestCase):
     )
     self.assertIn("Denied by user", resp.deny_reason)
 
+  async def test_ask_user_deny_with_reason(self):
+    """ASK_USER handler returns False + reason from request -> reason propagated."""
+    p = policy.ask_user(
+        "run_command", handler=lambda tc: False, name="ask-deny"
+    )
+    _, pmap = policy._to_policy_config_proto([p])
+    event = _make_policy_decision_request(
+        rule_id="rule_0", reason="Flagged by model"
+    )
+    resp = await self._process_and_get_response(pmap, event)
+    self.assertEqual(
+        resp.outcome, localharness_pb2.POLICY_EVALUATION_OUTCOME_DENY
+    )
+    self.assertEqual(resp.deny_reason, "Flagged by model")
+
+  async def test_when_predicate_matches_deny_with_reason(self):
+    """when returns True + DENY + reason from request -> reason propagated."""
+    p = policy.deny("run_command", when=lambda args: True, name="block-all")
+    _, pmap = policy._to_policy_config_proto([p])
+    event = _make_policy_decision_request(
+        rule_id="rule_0", reason="Policy violation"
+    )
+    resp = await self._process_and_get_response(pmap, event)
+    self.assertEqual(
+        resp.outcome, localharness_pb2.POLICY_EVALUATION_OUTCOME_DENY
+    )
+    self.assertEqual(resp.deny_reason, "Policy violation")
+
+  async def test_ask_user_passes_reason_to_handler(self):
+    """ASK_USER handler receives reason from PolicyDecisionRequest."""
+    captured = []
+
+    def handler(tc, reason=""):
+      del tc
+      captured.append(reason)
+      return True
+
+    p = policy.ask_user("run_command", handler=handler, name="ask-reason")
+    _, pmap = policy._to_policy_config_proto([p])
+    event = _make_policy_decision_request(
+        rule_id="rule_0", reason="Flagged by safety analysis"
+    )
+    resp = await self._process_and_get_response(pmap, event)
+    self.assertEqual(
+        resp.outcome, localharness_pb2.POLICY_EVALUATION_OUTCOME_ALLOW
+    )
+    self.assertEqual(captured, ["Flagged by safety analysis"])
+
   async def test_ask_user_with_when_no_match(self):
     """ASK_USER + when=False -> OUTCOME_NO_MATCH (handler never called)."""
     handler_mock = mock.Mock(return_value=True)
@@ -782,6 +1142,21 @@ class PolicyDecisionTest(unittest.IsolatedAsyncioTestCase):
         resp.outcome, localharness_pb2.POLICY_EVALUATION_OUTCOME_DENY
     )
     self.assertEqual(captured.get("CommandLine"), "echo hello")
+
+  async def test_ask_user_without_handler_fails_closed(self):
+    """ASK_USER policy without ask_user handler -> OUTCOME_DENY."""
+    p = policy.Policy(
+        tool="run_command",
+        decision=policy.Decision.ASK_USER,
+        name="ask-no-handler",
+    )
+    pmap = {"rule_0": p}
+    event = _make_policy_decision_request(rule_id="rule_0")
+    resp = await self._process_and_get_response(pmap, event)
+    self.assertEqual(
+        resp.outcome, localharness_pb2.POLICY_EVALUATION_OUTCOME_DENY
+    )
+    self.assertIn("requires ask_user handler", resp.deny_reason)
 
 
 if __name__ == "__main__":

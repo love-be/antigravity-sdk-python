@@ -77,15 +77,10 @@ class Agent:
       # Apply policies
       active_policies = list(self._config.policies)
       cfg = self._config.capabilities
-      read_only_tools = set(types.BuiltinTools.read_only())
-      # enabled_tools and disabled_tools are mutually exclusive
-      # (enforced by CapabilitiesConfig validation).
-      if cfg.enabled_tools is not None:
-        active_tools = set(cfg.enabled_tools)
-      elif cfg.disabled_tools is not None:
-        active_tools = set(types.BuiltinTools) - set(cfg.disabled_tools)
-      else:
-        active_tools = set(types.BuiltinTools)
+      read_only_tools = set(types.BuiltinTools.read_only()) | set(
+          types.BuiltinTools.deprecated()
+      )
+      active_tools = connection_module.resolve_active_tools(cfg)
       has_write_tools = bool(active_tools - read_only_tools)
       has_mcp_servers = bool(self._config.mcp_servers)
       has_tool_decide_hook = bool(self._hook_runner.pre_tool_call_decide_hooks)
@@ -102,8 +97,9 @@ class Agent:
             "to selectively allow specific tools."
         )
 
-      all_tools = list(self._config.tools)
-      self._tool_runner = tool_runner.ToolRunner(tools=all_tools)
+      self._tool_runner = tool_runner.ToolRunner(
+          tools=self._config._get_all_custom_tools()
+      )
 
       self._strategy = self._config.create_strategy(
           tool_runner=self._tool_runner,
@@ -209,9 +205,22 @@ class Agent:
     """Returns the conversation identifier assigned by the runtime.
 
     Available after the session has started and at least one message has
-    been exchanged.  Pass this value back via SessionConfig.conversation_id
+    been exchanged.  Pass this value back via AgentConfig.conversation_id
     to resume from a saved session.  Returns None before the session starts.
     """
     if not self._conversation:
       return None
     return self._conversation.conversation_id or None
+
+  @property
+  def sandbox_status(self) -> types.SandboxStatus | None:
+    """Returns the OS command sandbox status reported by the harness.
+
+    When ``enable_sandbox`` was requested but ``sandbox_status.available`` is
+    False, run_command executed unsandboxed. Application authors can inspect
+    this to surface fallback UX. Returns None before the session starts or when
+    the harness did not report a status.
+    """
+    if not self._conversation:
+      return None
+    return self._conversation.sandbox_status

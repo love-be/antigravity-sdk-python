@@ -61,7 +61,7 @@ PROTO_FIELD_TO_SDK_NAME: dict[str, str] = {
 # Argument keys in tool call JSON payloads that carry wire-format URIs
 # (file:///..., cns://...) and must be normalized to clean filesystem paths.
 WIRE_PATH_ARGUMENT_KEYS: frozenset[str] = frozenset(
-    {"path", "file_path", "directory_path", "TargetFile"}
+    {"path", "file_path", "directory_path", "TargetFile", "output_path"}
 )
 
 
@@ -82,6 +82,46 @@ def normalize_wire_path(path: str) -> str:
     # Convert to the canonical /cns/<cell>/... absolute path format.
     return "/cns/" + parsed.netloc + parsed.path
   return path
+
+
+def normalize_workspace_path(path: str | os.PathLike[str]) -> str:
+  """Normalizes wire URIs, expands user home ~, and resolves relative paths."""
+  path_str = os.fspath(path)
+  if not path_str:
+    return ""
+  normalized = normalize_wire_path(path_str)
+  if normalized.startswith("/cns/"):
+    return normalized
+  parsed = urllib.parse.urlparse(normalized)
+  if not parsed.scheme or parsed.scheme == "file":
+    return str(pathlib.Path(normalized).expanduser().resolve())
+  return normalized
+
+
+def normalize_workspace_paths(
+    workspaces: (
+        Sequence[str | os.PathLike[str]] | str | os.PathLike[str] | None
+    ),
+    *,
+    default_to_cwd: bool = False,
+) -> list[str]:
+  """Coerces single/sequence workspace paths and normalizes each entry."""
+  if workspaces is None:
+    return [os.getcwd()] if default_to_cwd else []
+  if isinstance(workspaces, (str, os.PathLike)):
+    return [normalize_workspace_path(workspaces)]
+  if isinstance(workspaces, (list, tuple, Sequence)) and not isinstance(
+      workspaces, (str, bytes)
+  ):
+    return [normalize_workspace_path(ws) for ws in workspaces]
+  raise ValueError(
+      f"workspaces must be a sequence of paths, got {type(workspaces).__name__}"
+  )
+
+
+def make_step_id(trajectory_id: str, step_index: int) -> str:
+  """Creates a unique step identifier from trajectory ID and step index."""
+  return f"{trajectory_id}:{step_index}" if trajectory_id else str(step_index)
 
 
 class BaseLocalAgentConfig(connection.AgentConfig):
@@ -106,11 +146,41 @@ class BaseLocalAgentConfig(connection.AgentConfig):
   )
   workspaces: list[str] = pydantic.Field(default_factory=lambda: [os.getcwd()])
 
+  @pydantic.field_validator("workspaces", mode="before")
+  @classmethod
+  def _validate_workspaces(cls, v: Any) -> list[str]:
+    return normalize_workspace_paths(v, default_to_cwd=True)
+
   @pydantic.field_validator("app_data_dir")
-  def _validate_app_data_dir(cls, v: str | None) -> str | None:  # pylint: disable=no-self-argument
+  @classmethod
+  def _validate_app_data_dir(cls, v: str | None) -> str | None:
     if v is not None and not os.path.isabs(v):
       raise ValueError(f"app_data_dir must be an absolute path, got '{v}'")
     return v
+
+  @pydantic.model_validator(mode="after")
+  def _validate_allowed_subagents(self) -> "BaseLocalAgentConfig":
+    declared_names = {
+        sub.name for sub in self.subagents or [] if getattr(sub, "name", None)
+    }
+    valid_names = declared_names
+    if self.capabilities and self.capabilities.allowed_subagents is not None:
+      unknown = set(self.capabilities.allowed_subagents) - valid_names
+      if unknown:
+        raise ValueError(
+            "Unknown subagent name(s) in CapabilitiesConfig.allowed_subagents:"
+            f" {sorted(unknown)}. Valid subagents are: {sorted(valid_names)}"
+        )
+    for sub in self.subagents or []:
+      if sub.capabilities and sub.capabilities.allowed_subagents is not None:
+        unknown = set(sub.capabilities.allowed_subagents) - valid_names
+        if unknown:
+          raise ValueError(
+              "Unknown subagent name(s) in"
+              f" SubagentConfig('{sub.name}').capabilities.allowed_subagents:"
+              f" {sorted(unknown)}. Valid subagents are: {sorted(valid_names)}"
+          )
+    return self
 
   def _get_system_instructions(self) -> types.SystemInstructions | None:
     """Returns the system instructions, normalizing shorthand if needed."""
@@ -175,6 +245,8 @@ class LocalAgentConfig(BaseLocalAgentConfig):
       ) = None,
       skills_paths: list[str] | None = None,
       retry_config: types.RetryConfig | None = None,
+      budget_config: types.BudgetConfig | None = None,
+      compaction_config: types.CompactionConfig | None = None,
       model: str | types.ModelTarget | None = None,
       models: list[types.ModelTarget] | None = None,
       api_key: str | None = None,
@@ -209,6 +281,7 @@ class LocalAgentConfig(BaseLocalAgentConfig):
       return types.VertexEndpoint(
           project=self.project,
           location=self.location,
+          api_key=self.api_key,
       )
     return types.GeminiAPIEndpoint(api_key=self.api_key)
 
@@ -296,6 +369,7 @@ class LocalAgentConfig(BaseLocalAgentConfig):
         models=self.models,
         system_instructions=self._get_system_instructions(),
         capabilities_config=self.capabilities,
+        compaction_config=self._get_effective_compaction_config(),
         conversation_id=self.conversation_id,
         session_continuation_mode=self.session_continuation_mode,
         save_dir=self._get_or_create_save_dir(),
@@ -307,5 +381,7 @@ class LocalAgentConfig(BaseLocalAgentConfig):
         subagents=self.subagents,
         debug_config=self.debug_config,
         retry_config=self.retry_config,
-        policies=list(self.policies),
+        budget_config=self.budget_config,
+        policies=list(self.policies) if self.policies is not None else None,
+        tools=self.tools,
     )

@@ -33,7 +33,9 @@ Includes:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 import contextvars
+import re
 import sys
 import threading
 from typing import Any
@@ -55,8 +57,7 @@ async def async_input(prompt: str = "") -> str:
 
   Using `asyncio.to_thread(input)` is not an option as executor runs in a
   non-daemon thread and will hang waiting for "enter" to be pressed on the
-  asyncio loop terdown.
-
+  asyncio loop teardown.
 
   Args:
     prompt: The prompt to display.
@@ -194,6 +195,18 @@ class Spinner:
     sys.stdout.flush()
 
 
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _sanitize_terminal_text(text: Any) -> str:
+  """Strips ANSI escape sequences and control characters to prevent UI spoofing."""
+  s = str(text)
+  s = _ANSI_CSI_RE.sub("", s)
+  s = _CONTROL_CHARS_RE.sub("", s)
+  return s
+
+
 class ToolConfirmationHook(hooks.PreToolCallDecideHook):
   """Hook that prompts the user for confirmation before executing a tool."""
 
@@ -211,10 +224,13 @@ class ToolConfirmationHook(hooks.PreToolCallDecideHook):
     """
     Spinner.pause_active()
     try:
-      print(f"\nTool execution requested: {data.name}")
+      print(
+          "\nTool execution requested:"
+          f" {_sanitize_terminal_text(data.name)}"
+      )
 
       if data.args:
-        print(f"Arguments: {data.args}")
+        print(f"Arguments: {_sanitize_terminal_text(data.args)}")
 
       try:
         ans = await async_input("Allow execution? (y/n) [n]: ")
@@ -228,22 +244,41 @@ class ToolConfirmationHook(hooks.PreToolCallDecideHook):
       Spinner.resume_active()
 
 
-async def ask_user_handler(tc: types.ToolCall) -> bool:
-  """Prompts the user for confirmation before executing a tool.
+async def ask_user_handler(tc: types.ToolCall, reason: str = "") -> bool:
+  """Prompts the user for confirmation in the terminal before executing a tool.
 
-  This is a convenient handler for use with the policy system.
+  This is a built-in interactive CLI confirmation handler designed for use with
+  ASK_USER policies and auto policy mode.
+
+  When is this called?
+    This handler is invoked automatically by the policy evaluation runtime
+    whenever an agent attempts to execute a tool call governed by an ASK_USER
+    policy, or when a safety assessor in auto policy mode flags an action for
+    human confirmation.
 
   Args:
-    tc: The tool call requested by the agent.
+    tc: The tool call requested by the agent (contains tool name and arguments).
+    reason: An explanation string supplied by the policy evaluation runtime
+      (e.g., safety assessment in auto policy mode or rule denial reason)
+      explaining why confirmation is requested and what security/safety risks
+      were flagged.
+      Handlers do not set this parameter; they receive it from the runtime to
+      display to the user so the user can make an informed decision.
 
   Returns:
-    True if the user allows execution, False otherwise.
+    True if the human user confirms and allows execution (entering 'y' or
+    'yes'), False if denied.
   """
   Spinner.pause_active()
   try:
-    print(f"\nPolicy check: Tool execution requested: {tc.name}")
+    print(
+        "\nPolicy check: Tool execution requested:"
+        f" {_sanitize_terminal_text(tc.name)}"
+    )
+    if reason:
+      print(f"Reason: {_sanitize_terminal_text(reason)}")
     if tc.args:
-      print(f"Arguments: {tc.args}")
+      print(f"Arguments: {_sanitize_terminal_text(tc.args)}")
 
     try:
       ans = await async_input("Allow execution? (y/n) [n]: ")
@@ -320,13 +355,14 @@ class AskQuestionHook(hooks.OnInteractionHook):
       Spinner.resume_active()
 
 
-def _upgrade_policies_list(policies: list[Any]) -> list[Any]:
-  """Upgrades RUN_COMMAND deny policies in place to ASK_USER policy."""
+def _upgrade_policies_list(
+    policies: Sequence[policy_module.Policy | Sequence[policy_module.Policy]],
+) -> list[policy_module.Policy]:
+  """Upgrades RUN_COMMAND deny policies and auto policy mode policies in place to ASK_USER."""
   upgraded = []
-  for p in policies:
+  for p in policy_module.flatten_policies(policies):
     if (
-        isinstance(p, policy_module.Policy)
-        and p.tool == types.BuiltinTools.RUN_COMMAND.value
+        p.tool == types.BuiltinTools.RUN_COMMAND.value
         and p.decision == policy_module.Decision.DENY
         and p.when is None
     ):
@@ -335,6 +371,16 @@ def _upgrade_policies_list(policies: list[Any]) -> list[Any]:
               types.BuiltinTools.RUN_COMMAND.value,
               handler=ask_user_handler,
               name=p.name or "interactive_confirm",
+          )
+      )
+    elif (
+        isinstance(p, policy_module.AutoPolicy) and p.ask_user is None
+    ):
+      upgraded.append(
+          policy_module.auto(
+              name=p.name or "auto",
+              handler=ask_user_handler,
+              model=p.model,
           )
       )
     else:
@@ -365,7 +411,8 @@ async def run_interactive_loop(
   """Runs an interactive CLI loop for debugging and development.
 
   Constructs and runs the agent within an interactive session, registering an
-  ``AskQuestionHook`` and upgrading ``confirm_run_command()`` to ASK_USER
+  ``AskQuestionHook``, upgrading ``confirm_run_command()`` to ASK_USER, and
+  ensuring ``agent_behavior`` is set to ``AgentBehavior.INTERACTIVE``
   so the user can answer prompts from the model.
 
   Type ``exit`` or ``quit`` to end the session. Ctrl+C also exits cleanly.
@@ -380,8 +427,18 @@ async def run_interactive_loop(
 
   policies_list = _upgrade_policies_list(config.policies)
 
+  capabilities = config.capabilities
+  if capabilities.agent_behavior != types.AgentBehavior.INTERACTIVE:
+    capabilities = capabilities.model_copy(
+        update={"agent_behavior": types.AgentBehavior.INTERACTIVE}
+    )
+
   upgraded_config = config.model_copy(
-      update={"hooks": hooks_list, "policies": policies_list}
+      update={
+          "hooks": hooks_list,
+          "policies": policies_list,
+          "capabilities": capabilities,
+      }
   )
   agent = agent_class(upgraded_config)
 

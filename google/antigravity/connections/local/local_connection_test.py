@@ -17,15 +17,23 @@
 import asyncio
 import base64
 import datetime
+import enum
+import http.server
 import importlib
 import io
+import json
 import os
 import pathlib
+import socketserver
 import struct
 import subprocess
 import tempfile
+import threading
+import typing
+from typing import Any, Literal, Union
 import unittest
 from unittest import mock
+import warnings
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -33,17 +41,81 @@ import pydantic
 import websockets
 
 from google.antigravity.proto import localharness_pb2
+from google.antigravity import models as models_lib
 from google.antigravity import types
 from google.antigravity.connections.local import event_processor
+from google.antigravity.connections.local import litert_connection_config
 from google.antigravity.connections.local import local_connection
 from google.antigravity.connections.local import local_connection_config
+from google.antigravity.connections.local import local_openai_connection_config
+from google.antigravity.connections.local import struct_converter
 from google.antigravity.connections.local import test_utils
 from google.antigravity.hooks import hook_runner
 from google.antigravity.hooks import hooks as hooks_base
 from google.antigravity.hooks import policy
-from google.antigravity.models import DEFAULT_MODEL
+from google.antigravity.tools import tool_context
 from google.antigravity.tools import tool_runner
-from google.antigravity.types import QuestionResponse
+
+
+class WarnIfSandboxUnavailableTest(absltest.TestCase):
+  """Tests for local_connection.warn_if_sandbox_unavailable."""
+
+  def _run_command_cfg(self, *, enabled=True, enable_sandbox=True):
+    return localharness_pb2.RunCommandToolConfig(
+        enabled=enabled, enable_sandbox=enable_sandbox
+    )
+
+  def test_warns_when_requested_and_unavailable(self):
+    status = types.SandboxStatus(
+        available=False, unavailable_reason="no user namespaces"
+    )
+    with mock.patch.object(local_connection.logging, "warning") as warn:
+      local_connection.warn_if_sandbox_unavailable(
+          self._run_command_cfg(), status
+      )
+    warn.assert_called_once()
+    self.assertEqual(warn.call_args.args[1], "no user namespaces")
+
+  def test_warns_reason_unknown_when_reason_missing(self):
+    status = types.SandboxStatus(available=False)
+    with mock.patch.object(local_connection.logging, "warning") as warn:
+      local_connection.warn_if_sandbox_unavailable(
+          self._run_command_cfg(), status
+      )
+    warn.assert_called_once()
+    self.assertEqual(warn.call_args.args[1], "reason unknown")
+
+  def test_no_warning_when_available(self):
+    status = types.SandboxStatus(available=True)
+    with mock.patch.object(local_connection.logging, "warning") as warn:
+      local_connection.warn_if_sandbox_unavailable(
+          self._run_command_cfg(), status
+      )
+    warn.assert_not_called()
+
+  def test_no_warning_when_status_unset(self):
+    # Older harness that omits sandbox status -> no spurious warning.
+    with mock.patch.object(local_connection.logging, "warning") as warn:
+      local_connection.warn_if_sandbox_unavailable(
+          self._run_command_cfg(), None
+      )
+    warn.assert_not_called()
+
+  def test_no_warning_when_sandbox_not_requested(self):
+    status = types.SandboxStatus(available=False, unavailable_reason="x")
+    with mock.patch.object(local_connection.logging, "warning") as warn:
+      local_connection.warn_if_sandbox_unavailable(
+          self._run_command_cfg(enable_sandbox=False), status
+      )
+    warn.assert_not_called()
+
+  def test_no_warning_when_run_command_disabled(self):
+    status = types.SandboxStatus(available=False, unavailable_reason="x")
+    with mock.patch.object(local_connection.logging, "warning") as warn:
+      local_connection.warn_if_sandbox_unavailable(
+          self._run_command_cfg(enabled=False), status
+      )
+    warn.assert_not_called()
 
 
 class PromptSanitizationTest(unittest.TestCase):
@@ -64,6 +136,196 @@ class PromptSanitizationTest(unittest.TestCase):
   def test_to_proto_input_content_sanitizes_strings(self):
     part = local_connection.to_proto_input_content("Bad\x00Input\x7f")
     self.assertEqual(part.text, "Bad Input ")
+
+
+class CallableToToolProtoTest(unittest.TestCase):
+  """Tests for callable_to_tool_proto schema conversion."""
+
+  def test_callable_to_tool_proto_schema_lowercase_types(self):
+    def get_temperature(location: str) -> str:
+      """Get the current temperature."""
+      return f"The temperature in {location} is 72°F."
+
+    proto = local_connection.callable_to_tool_proto(get_temperature)
+    schema = json.loads(proto.parameters_json_schema)
+    self.assertEqual(schema.get("type"), "object")
+    self.assertEqual(
+        schema.get("properties", {}).get("location", {}).get("type"),
+        "string",
+    )
+
+  def test_callable_to_tool_proto_complex_types(self):
+    class ItemDetail(pydantic.BaseModel):
+      item_name: str
+      quantity: int = 1
+
+    # pylint: disable=unused-argument
+    def create_order(
+        order_id: str,
+        count: int,
+        price: float,
+        is_express: bool,
+        tags: list[str],
+        items: list[ItemDetail],
+    ) -> dict[str, str]:
+      """Create a new order with details."""
+      return {"order_id": order_id}
+    # pylint: enable=unused-argument
+
+    proto = local_connection.callable_to_tool_proto(create_order)
+    schema = json.loads(proto.parameters_json_schema)
+    self.assertEqual(schema.get("type"), "object")
+    props = schema.get("properties", {})
+    self.assertEqual(props.get("order_id", {}).get("type"), "string")
+    self.assertEqual(props.get("count", {}).get("type"), "integer")
+    self.assertEqual(props.get("price", {}).get("type"), "number")
+    self.assertEqual(props.get("is_express", {}).get("type"), "boolean")
+    self.assertEqual(props.get("tags", {}).get("type"), "array")
+    self.assertEqual(
+        props.get("tags", {}).get("items", {}).get("type"), "string"
+    )
+    self.assertEqual(props.get("items", {}).get("type"), "array")
+
+  def test_callable_to_tool_proto_enum_preserves_values(self):
+    class Direction(enum.Enum):
+      NORTH = "NORTH"
+      SOUTH = "SOUTH"
+      EAST = "EAST"
+      WEST = "WEST"
+
+    def navigate(direction: Direction) -> str:
+      """Navigate in a direction."""
+      return f"Heading {direction.value}"
+
+    proto = local_connection.callable_to_tool_proto(navigate)
+    schema = json.loads(proto.parameters_json_schema)
+    self.assertEqual(schema.get("type"), "object")
+    dir_prop = schema.get("properties", {}).get("direction", {})
+    self.assertEqual(dir_prop.get("type"), "string")
+    self.assertEqual(
+        dir_prop.get("enum"), ["NORTH", "SOUTH", "EAST", "WEST"]
+    )
+
+  def test_callable_to_tool_proto_no_params(self):
+    def get_version() -> str:
+      """Return system version."""
+      return "1.0.0"
+
+    proto = local_connection.callable_to_tool_proto(get_version)
+    schema = json.loads(proto.parameters_json_schema)
+    self.assertEqual(schema.get("type"), "object")
+
+  def test_callable_to_tool_proto_tool_with_schema(self):
+    def raw_search(query: str) -> str:
+      """Search documents."""
+      return query
+
+    tool = tool_runner.ToolWithSchema(
+        fn=raw_search,
+        input_schema={
+            "type": "OBJECT",
+            "properties": {"query": {"type": "STRING"}},
+        },
+    )
+
+    proto = local_connection.callable_to_tool_proto(tool)
+    schema = json.loads(proto.parameters_json_schema)
+    self.assertEqual(schema.get("type"), "object")
+    self.assertEqual(
+        schema.get("properties", {}).get("query", {}).get("type"), "string"
+    )
+
+  def test_callable_to_tool_proto_param_named_type_collision(self):
+    # pylint: disable=redefined-builtin
+    def configure(type: str, timeout: int) -> dict[str, Any]:
+      """Configure system with type and timeout."""
+      return {"type": type, "timeout": timeout}
+    # pylint: enable=redefined-builtin
+
+    proto = local_connection.callable_to_tool_proto(configure)
+    schema = json.loads(proto.parameters_json_schema)
+    self.assertEqual(schema.get("type"), "object")
+    props = schema.get("properties", {})
+    self.assertIn("type", props)
+    self.assertEqual(props["type"].get("type"), "string")
+    self.assertEqual(props.get("timeout", {}).get("type"), "integer")
+
+  def test_callable_to_tool_proto_literal_enum_preservation(self):
+    def set_log_level(
+        level: Literal["DEBUG", "INFO", "WARNING", "ERROR"],
+    ) -> str:
+      """Set logging level."""
+      return level
+
+    proto = local_connection.callable_to_tool_proto(set_log_level)
+    schema = json.loads(proto.parameters_json_schema)
+    self.assertEqual(schema.get("type"), "object")
+    level_prop = schema.get("properties", {}).get("level", {})
+    self.assertEqual(level_prop.get("type"), "string")
+    self.assertEqual(
+        level_prop.get("enum"), ["DEBUG", "INFO", "WARNING", "ERROR"]
+    )
+
+  def test_callable_to_tool_proto_union_combiners(self):
+    def process_id(identifier: Union[int, str]) -> str:
+      """Process an identifier that can be int or str."""
+      return str(identifier)
+
+    proto = local_connection.callable_to_tool_proto(process_id)
+    schema = json.loads(proto.parameters_json_schema)
+    self.assertEqual(schema.get("type"), "object")
+    id_prop = schema.get("properties", {}).get("identifier", {})
+    self.assertIn("anyOf", id_prop)
+    self.assertNotIn("any_of", id_prop)
+    combiner = id_prop["anyOf"]
+    types_in_union = {c.get("type") for c in combiner if isinstance(c, dict)}
+    self.assertTrue({"integer", "string"}.issubset(types_in_union))
+
+  def test_callable_to_tool_proto_tool_context_injection_stripping(self):
+    # pylint: disable=unused-argument
+    def inspect_tool(ctx: tool_context.ToolContext, query: str) -> str:
+      """Tool that requests context injection."""
+      return query
+    # pylint: enable=unused-argument
+
+    runner = tool_runner.ToolRunner([inspect_tool])
+    proto = local_connection.callable_to_tool_proto(
+        inspect_tool, tool_runner=runner
+    )
+    schema = json.loads(proto.parameters_json_schema)
+    self.assertEqual(schema.get("type"), "object")
+    props = schema.get("properties", {})
+    self.assertNotIn("ctx", props)
+    self.assertIn("query", props)
+    self.assertEqual(props["query"].get("type"), "string")
+
+  def test_callable_to_tool_proto_tool_with_schema_uppercase_types(self):
+    def raw_fn(x: int) -> int:
+      return x
+
+    tool = tool_runner.ToolWithSchema(
+        fn=raw_fn,
+        input_schema={
+            "type": "OBJECT",
+            "properties": {
+                "count": {"type": "INTEGER"},
+                "rate": {"type": "NUMBER"},
+            },
+            "const": "UPPERCASE_CONST",
+            "default": "DEFAULT_VAL",
+        },
+    )
+    proto = local_connection.callable_to_tool_proto(tool)
+    schema = json.loads(proto.parameters_json_schema)
+    self.assertEqual(schema.get("type"), "object")
+    self.assertEqual(
+        schema.get("properties", {}).get("count", {}).get("type"), "integer"
+    )
+    self.assertEqual(
+        schema.get("properties", {}).get("rate", {}).get("type"), "number"
+    )
+    self.assertEqual(schema.get("const"), "UPPERCASE_CONST")
+    self.assertEqual(schema.get("default"), "DEFAULT_VAL")
 
 
 class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
@@ -185,7 +447,7 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
 
     await harness.conn.send("Hello")
     init_data = await harness.wait_for_response()
-    self.assertEqual(init_data.get("userInput"), "Hello")
+    self.assertEqual(init_data.get("userInput"), {"parts": [{"text": "Hello"}]})
 
     # Set the cascade ID and send the 429 error step.
     event1 = localharness_pb2.OutputEvent(
@@ -231,7 +493,7 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
 
     await harness.conn.send("Hello")
     init_data = await harness.wait_for_response()
-    self.assertEqual(init_data.get("userInput"), "Hello")
+    self.assertEqual(init_data.get("userInput"), {"parts": [{"text": "Hello"}]})
 
     # Set the cascade ID.
     event1 = localharness_pb2.OutputEvent(
@@ -272,7 +534,7 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
 
     await harness.conn.send("Hello")
     init_data = await harness.wait_for_response()
-    self.assertEqual(init_data.get("userInput"), "Hello")
+    self.assertEqual(init_data.get("userInput"), {"parts": [{"text": "Hello"}]})
 
     # Send an error indicating MCP failure.
     event = localharness_pb2.OutputEvent(
@@ -298,7 +560,7 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
 
     await harness.conn.send("Hello")
     init_data = await harness.wait_for_response()
-    self.assertEqual(init_data.get("userInput"), "Hello")
+    self.assertEqual(init_data.get("userInput"), {"parts": [{"text": "Hello"}]})
 
     # 1. Harness sends STATE_IDLE (e.g. while processing tool call)
     event1 = localharness_pb2.OutputEvent(
@@ -494,11 +756,302 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(step.content_delta, "")
     self.assertEqual(step.thinking_delta, "")
 
+  def test_local_connection_step_from_dict_mcp_tool_arguments_dict(self):
+    """Tests that mcp_tool with arguments dict is correctly parsed."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "mcp_tool": {
+            "server_name": "my_server",
+            "tool_name": "my_tool",
+            "arguments": {"param1": "val1", "count": 42},
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].name, "my_tool")
+    self.assertEqual(step.tool_calls[0].server_name, "my_server")
+    self.assertEqual(step.tool_calls[0].args, {"param1": "val1", "count": 42})
+
+  def test_local_connection_step_from_dict_mcp_tool_args_dict(self):
+    """Tests that mcp_tool with args dict is correctly parsed."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "mcp_tool": {
+            "server_name": "my_server",
+            "tool_name": "my_tool",
+            "args": {"param1": "val1"},
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].name, "my_tool")
+    self.assertEqual(step.tool_calls[0].args, {"param1": "val1"})
+
+  def test_local_connection_step_from_dict_mcp_tool_arguments_json(self):
+    """Tests that mcp_tool with arguments_json string is correctly parsed."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "mcp_tool": {
+            "server_name": "my_server",
+            "tool_name": "my_tool",
+            "arguments_json": '{"param1": "val1"}',
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].name, "my_tool")
+    self.assertEqual(step.tool_calls[0].args, {"param1": "val1"})
+
+  def test_local_connection_step_from_dict_mcp_tool_invalid_json(self):
+    """Tests that mcp_tool with invalid arguments_json falls back to empty dict."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "mcp_tool": {
+            "server_name": "my_server",
+            "tool_name": "my_tool",
+            "arguments_json": "{invalid_json}",
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].args, {})
+
+  def test_local_connection_step_from_dict_custom_tool_nested_arguments_dict(self):
+    """Tests that custom_tool.tool_call with arguments dict is correctly parsed."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "custom_tool": {
+            "tool_call": {
+                "id": "tc_1",
+                "name": "search_docs",
+                "arguments": {"query": "test query"},
+            }
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].name, "search_docs")
+    self.assertEqual(step.tool_calls[0].id, "tc_1")
+    self.assertEqual(step.tool_calls[0].args, {"query": "test query"})
+
+  def test_local_connection_step_from_dict_custom_tool_nested_args_dict(self):
+    """Tests that custom_tool.tool_call with args dict is correctly parsed."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "custom_tool": {
+            "tool_call": {
+                "id": "tc_1",
+                "name": "search_docs",
+                "args": {"query": "test query"},
+            }
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].args, {"query": "test query"})
+
+  def test_local_connection_step_from_dict_custom_tool_nested_arguments_json(self):
+    """Tests that custom_tool.tool_call with arguments_json is correctly parsed."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "custom_tool": {
+            "tool_call": {
+                "id": "tc_1",
+                "name": "search_docs",
+                "arguments_json": '{"query": "test query"}',
+            }
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].args, {"query": "test query"})
+
+  def test_local_connection_step_from_dict_custom_tool_direct_dict(self):
+    """Tests that custom_tool directly containing tool call fields is correctly parsed."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "custom_tool": {
+            "id": "tc_2",
+            "name": "run_analysis",
+            "arguments": {"mode": "deep"},
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].name, "run_analysis")
+    self.assertEqual(step.tool_calls[0].id, "tc_2")
+    self.assertEqual(step.tool_calls[0].args, {"mode": "deep"})
+
+  def test_local_connection_step_from_dict_custom_tool_invalid_json(self):
+    """Tests that custom_tool with invalid arguments_json falls back to empty dict."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "custom_tool": {
+            "id": "tc_3",
+            "name": "broken_tool",
+            "arguments_json": "{not_valid_json}",
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].args, {})
+
+  def test_local_connection_step_from_dict_custom_tool_arguments_precedence(
+      self,
+  ):
+    """Tests that structured arguments takes precedence over arguments_json."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "custom_tool": {
+            "id": "tc_prec",
+            "name": "prec_tool",
+            "arguments": {"mode": "structured"},
+            "arguments_json": '{"mode": "stringified"}',
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].args, {"mode": "structured"})
+
+  def test_local_connection_step_from_dict_mcp_tool_arguments_precedence(self):
+    """Tests that mcp_tool structured arguments takes precedence over arguments_json."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "mcp_tool": {
+            "server_name": "srv",
+            "tool_name": "prec_tool",
+            "arguments": {"mode": "structured"},
+            "arguments_json": '{"mode": "stringified"}',
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].args, {"mode": "structured"})
+
+  def test_local_connection_step_from_dict_custom_tool_wire_struct(self):
+    """Tests that custom_tool with MessageToDict wire struct format is unpacked."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "custom_tool": {
+            "tool_call": {
+                "id": "tc_wire",
+                "name": "query_tool",
+                "arguments": {
+                    "fields": [
+                        {
+                            "name": "query",
+                            "value": {"string_value": "SELECT 1"},
+                        },
+                        {
+                            "name": "limit",
+                            "value": {"number_value": 10.0},
+                        },
+                    ]
+                },
+            }
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].name, "query_tool")
+    self.assertEqual(
+        step.tool_calls[0].args, {"query": "SELECT 1", "limit": 10.0}
+    )
+
+  def test_local_connection_step_from_dict_non_dict_json_number(self):
+    """Tests that numeric JSON in arguments_json falls back to empty dict."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "custom_tool": {
+            "id": "tc_scalar",
+            "name": "scalar_tool",
+            "arguments_json": "123",
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].args, {})
+
+  def test_local_connection_step_from_dict_non_dict_json_null(self):
+    """Tests that null JSON in arguments_json falls back to empty dict."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "custom_tool": {
+            "id": "tc_scalar",
+            "name": "scalar_tool",
+            "arguments_json": "null",
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].args, {})
+
+  def test_local_connection_step_from_dict_non_dict_json_string(self):
+    """Tests that string JSON in arguments_json falls back to empty dict."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "custom_tool": {
+            "id": "tc_scalar",
+            "name": "scalar_tool",
+            "arguments_json": '"string"',
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].args, {})
+
+  def test_local_connection_step_from_dict_non_dict_json_list(self):
+    """Tests that list JSON in arguments_json falls back to empty dict."""
+    step_dict = {
+        "step_index": 1,
+        "state": "STATE_DONE",
+        "source": "SOURCE_MODEL",
+        "custom_tool": {
+            "id": "tc_scalar",
+            "name": "scalar_tool",
+            "arguments_json": "[1, 2]",
+        },
+    }
+    step = local_connection.LocalConnectionStep.from_dict(step_dict)
+    self.assertEqual(len(step.tool_calls), 1)
+    self.assertEqual(step.tool_calls[0].args, {})
+
+
   async def test_turn_hook_deny(self):
     hr = hook_runner.HookRunner()
 
     @hooks_base.pre_turn
-    async def denying_turn(data):
+    async def denying_turn(_):
       return hooks_base.HookResult(allow=False, message="Denied by hook")
 
     hr.register_hook(denying_turn)
@@ -706,7 +1259,8 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
     sent_data = await harness.wait_for_response()
     resp = sent_data["toolResponse"]
     self.assertEqual(resp["id"], "call_img")
-    # The text part stays in response_json; the image becomes supplemental media.
+    # The text part stays in response_json; the image becomes supplemental
+    # media.
     self.assertIn("here is the snapshot", resp["responseJson"])
     self.assertIn("supplementalMedia", resp)
     self.assertEqual(resp["supplementalMedia"][0]["mimeType"], "image/jpeg")
@@ -773,10 +1327,10 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
     hr = hook_runner.HookRunner()
 
     @hooks_base.on_interaction
-    async def auto_answer(data):
+    async def auto_answer(_):
       return hooks_base.QuestionHookResult(
           responses=[
-              QuestionResponse(selected_option_ids=["1"]),
+              types.QuestionResponse(selected_option_ids=["1"]),
           ]
       )
 
@@ -817,10 +1371,10 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
     hr = hook_runner.HookRunner()
 
     @hooks_base.on_interaction
-    async def auto_answer(data):
+    async def auto_answer(_):
       return hooks_base.QuestionHookResult(
           responses=[
-              QuestionResponse(selected_option_ids=["1"]),
+              types.QuestionResponse(selected_option_ids=["1"]),
           ]
       )
 
@@ -846,7 +1400,8 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
                             choices=["Yes", "No"],
                         )
                     ),
-                    localharness_pb2.UserQuestion(),  # Unhandled question type (empty)
+                    # Unhandled question type (empty).
+                    localharness_pb2.UserQuestion(),
                 ]
             ),
         )
@@ -933,7 +1488,7 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
     # Start the turn
     await harness.conn.send("Hello")
     init_data = await harness.wait_for_response()
-    self.assertEqual(init_data.get("userInput"), "Hello")
+    self.assertEqual(init_data.get("userInput"), {"parts": [{"text": "Hello"}]})
 
     # Simulate an active generation step from the harness
     event1 = localharness_pb2.OutputEvent(
@@ -1003,7 +1558,6 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
 
     # Trigger connection event dispatch
     await conn._handle_tool_call(raw_tool_call)
-    await asyncio.sleep(0.1)
 
     self.assertFalse(conn._step_queue.empty())
     step_obj = await conn._step_queue.get()
@@ -1029,6 +1583,180 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
     }
 
     self.assertEqual(actual_properties, expected_properties)
+
+  async def test_handle_tool_call_with_proto_arguments_struct(self):
+    """Tests _handle_tool_call when tool_call has structured proto arguments."""
+    harness = self._make_harness()
+    conn = harness.conn
+
+    raw_tool_call = localharness_pb2.ToolCall(
+        id="call_456",
+        name="execute_query",
+        arguments=struct_converter.dict_to_struct(
+            {"query": "SELECT 1", "limit": 10}
+        ),
+    )
+
+    await conn._handle_tool_call(raw_tool_call)
+
+    self.assertFalse(conn._step_queue.empty())
+    step_obj = await conn._step_queue.get()
+    self.assertEqual(step_obj.id, "call_456")
+    self.assertEqual(len(step_obj.tool_calls), 1)
+    self.assertEqual(
+        step_obj.tool_calls[0].args, {"query": "SELECT 1", "limit": 10.0}
+    )
+
+  async def test_handle_tool_call_arguments_precedence_over_arguments_json(
+      self,
+  ):
+    """Tests that structured arguments takes precedence over arguments_json in handle_tool_call."""
+    harness = self._make_harness()
+    conn = harness.conn
+
+    raw_tool_call = localharness_pb2.ToolCall(
+        id="call_prec",
+        name="prec_tool",
+        arguments=struct_converter.dict_to_struct({"mode": "structured"}),
+        arguments_json='{"mode": "stringified"}',
+    )
+
+    await conn._handle_tool_call(raw_tool_call)
+
+    self.assertFalse(conn._step_queue.empty())
+    step_obj = await conn._step_queue.get()
+    self.assertEqual(step_obj.id, "call_prec")
+    self.assertEqual(len(step_obj.tool_calls), 1)
+    self.assertEqual(step_obj.tool_calls[0].args, {"mode": "structured"})
+
+  async def test_handle_tool_call_invalid_json_fallback(self):
+    """Tests _handle_tool_call when arguments_json is invalid JSON."""
+    harness = self._make_harness()
+    conn = harness.conn
+
+    raw_tool_call = localharness_pb2.ToolCall(
+        id="call_789",
+        name="bad_json_tool",
+        arguments_json="{invalid_json}",
+    )
+
+    await conn._handle_tool_call(raw_tool_call)
+
+    self.assertFalse(conn._step_queue.empty())
+    step_obj = await conn._step_queue.get()
+    self.assertEqual(step_obj.id, "call_789")
+    self.assertEqual(len(step_obj.tool_calls), 1)
+    self.assertEqual(step_obj.tool_calls[0].args, {})
+
+  async def test_handle_tool_call_non_dict_json_number(self):
+    """Tests _handle_tool_call when arguments_json is a numeric JSON scalar."""
+    harness = self._make_harness()
+    conn = harness.conn
+    raw_tool_call = localharness_pb2.ToolCall(
+        id="call_scalar",
+        name="scalar_tool",
+        arguments_json="123",
+    )
+    await conn._handle_tool_call(raw_tool_call)
+    self.assertFalse(conn._step_queue.empty())
+    step_obj = await conn._step_queue.get()
+    self.assertEqual(step_obj.id, "call_scalar")
+    self.assertEqual(len(step_obj.tool_calls), 1)
+    self.assertEqual(step_obj.tool_calls[0].args, {})
+
+  async def test_handle_tool_call_non_dict_json_null(self):
+    """Tests _handle_tool_call when arguments_json is a null JSON scalar."""
+    harness = self._make_harness()
+    conn = harness.conn
+    raw_tool_call = localharness_pb2.ToolCall(
+        id="call_scalar",
+        name="scalar_tool",
+        arguments_json="null",
+    )
+    await conn._handle_tool_call(raw_tool_call)
+    self.assertFalse(conn._step_queue.empty())
+    step_obj = await conn._step_queue.get()
+    self.assertEqual(step_obj.id, "call_scalar")
+    self.assertEqual(len(step_obj.tool_calls), 1)
+    self.assertEqual(step_obj.tool_calls[0].args, {})
+
+  async def test_handle_tool_call_non_dict_json_string(self):
+    """Tests _handle_tool_call when arguments_json is a string JSON scalar."""
+    harness = self._make_harness()
+    conn = harness.conn
+    raw_tool_call = localharness_pb2.ToolCall(
+        id="call_scalar",
+        name="scalar_tool",
+        arguments_json='"string"',
+    )
+    await conn._handle_tool_call(raw_tool_call)
+    self.assertFalse(conn._step_queue.empty())
+    step_obj = await conn._step_queue.get()
+    self.assertEqual(step_obj.id, "call_scalar")
+    self.assertEqual(len(step_obj.tool_calls), 1)
+    self.assertEqual(step_obj.tool_calls[0].args, {})
+
+  async def test_handle_tool_call_non_dict_json_list(self):
+    """Tests _handle_tool_call when arguments_json is a list JSON."""
+    harness = self._make_harness()
+    conn = harness.conn
+    raw_tool_call = localharness_pb2.ToolCall(
+        id="call_scalar",
+        name="scalar_tool",
+        arguments_json="[1, 2]",
+    )
+    await conn._handle_tool_call(raw_tool_call)
+    self.assertFalse(conn._step_queue.empty())
+    step_obj = await conn._step_queue.get()
+    self.assertEqual(step_obj.id, "call_scalar")
+    self.assertEqual(len(step_obj.tool_calls), 1)
+    self.assertEqual(step_obj.tool_calls[0].args, {})
+
+
+  async def test_handle_tool_call_empty_arguments_fallback(self):
+    """Tests _handle_tool_call when both arguments and arguments_json are empty."""
+    harness = self._make_harness()
+    conn = harness.conn
+
+    raw_tool_call = localharness_pb2.ToolCall(
+        id="call_000",
+        name="no_args_tool",
+    )
+
+    await conn._handle_tool_call(raw_tool_call)
+
+    self.assertFalse(conn._step_queue.empty())
+    step_obj = await conn._step_queue.get()
+    self.assertEqual(step_obj.id, "call_000")
+    self.assertEqual(len(step_obj.tool_calls), 1)
+    self.assertEqual(step_obj.tool_calls[0].args, {})
+
+  async def test_handle_tool_call_populates_trajectory_id(self):
+    """Verifies that _handle_tool_call populates trajectory_id on LocalConnectionStep."""
+    harness = self._make_harness()
+    conn = harness.conn
+
+    raw_tool_call = localharness_pb2.ToolCall(
+        id="call_abc",
+        name="run_command",
+        arguments_json='{"command": "ls"}',
+        trajectory_id="traj_sub_123",
+    )
+
+    await conn._handle_tool_call(raw_tool_call)
+    await asyncio.sleep(0.1)
+
+    self.assertFalse(conn._step_queue.empty())
+    step_obj = await conn._step_queue.get()
+
+    self.assertEqual(step_obj.id, "call_abc")
+    self.assertEqual(step_obj.trajectory_id, "traj_sub_123")
+    self.assertEqual(step_obj.step_index, 1)
+    self.assertEqual(step_obj.type, types.StepType.TOOL_CALL)
+    self.assertEqual(len(step_obj.tool_calls), 1)
+    self.assertEqual(step_obj.tool_calls[0].id, "call_abc")
+    self.assertEqual(step_obj.tool_calls[0].name, "run_command")
+    self.assertEqual(step_obj.tool_calls[0].args, {"command": "ls"})
 
   async def test_wait_for_idle_does_not_deadlock(self):
     """Verifies that wait_for_idle completes when the connection goes idle.
@@ -1119,6 +1847,20 @@ class LocalConnectionTest(unittest.IsolatedAsyncioTestCase):
     )
     await asyncio.wait_for(consumer_task, timeout=1.0)
 
+  async def test_last_turn_stop_reason(self):
+    harness = self._make_harness()
+    self.assertEqual(
+        harness.conn._last_turn_stop_reason,
+        types.StopReason.UNSPECIFIED,
+    )
+    harness.conn._processor._turn_stop_reason = (
+        types.StopReason.QUOTA_EXHAUSTED
+    )
+    self.assertEqual(
+        harness.conn._last_turn_stop_reason,
+        types.StopReason.QUOTA_EXHAUSTED,
+    )
+
 
 class LocalConnectionToolCallNoRunnerTest(unittest.IsolatedAsyncioTestCase):
   """Tests for tool call handling when no ToolRunner is configured."""
@@ -1171,12 +1913,7 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    self.patcher = mock.patch(
-        "google.antigravity.connections.local.local_connection._get_default_binary_path",
-        return_value="/fake/binary",
-    )
-    self.patcher.start()
-    self.addCleanup(self.patcher.stop)
+    test_utils.patch_default_binary_path(self)
 
   def _make_strategy(self, **kwargs):
     """Creates a LocalConnectionStrategy with the given kwargs."""
@@ -1192,38 +1929,46 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
     strategy = self._make_strategy()
     config = strategy._build_harness_config()
     self.assertIsInstance(config, localharness_pb2.HarnessConfig)
-    # Default: all harness side tools enabled.
+    # Default: all harness side tools enabled except user_questions
+    # (ask_question), find (find_file), and grep_search (search_directory).
     self.assertTrue(config.harness_side_tools.subagents.enabled)
-    self.assertTrue(config.harness_side_tools.user_questions.enabled)
+    self.assertFalse(config.harness_side_tools.user_questions.enabled)
     self.assertTrue(config.harness_side_tools.run_command.enabled)
-    self.assertTrue(config.harness_side_tools.find.enabled)
+    self.assertTrue(config.harness_side_tools.manage_task.enabled)
+    self.assertTrue(config.harness_side_tools.schedule.enabled)
+    self.assertFalse(config.harness_side_tools.find.enabled)
+    self.assertFalse(config.harness_side_tools.grep_search.enabled)
     self.assertTrue(config.harness_side_tools.generate_image.enabled)
     # No models, system instructions, workspaces, or skills by default.
     self.assertEmpty(config.models)
     self.assertFalse(config.HasField("system_instructions"))
-    self.assertEqual(len(config.workspaces), 0)
-    self.assertEqual(config.agent_mode, localharness_pb2.AGENT_MODE_AUTONOMOUS)
+    self.assertEmpty(config.workspaces)
+    self.assertEqual(
+        config.agent_behavior, localharness_pb2.AGENT_BEHAVIOR_AUTONOMOUS
+    )
 
-  def test_agent_mode_config_produces_valid_proto(self):
-    """Verifies that agent_mode sets HarnessConfig.agent_mode."""
+  def test_agent_behavior_config_produces_valid_proto(self):
+    """Verifies that agent_behavior sets HarnessConfig.agent_behavior."""
     strategy = self._make_strategy(
         capabilities_config=types.CapabilitiesConfig(
-            agent_mode=types.AgentMode.INTERACTIVE
+            agent_behavior=types.AgentBehavior.INTERACTIVE
         )
     )
     config = strategy._build_harness_config()
-    self.assertEqual(config.agent_mode, localharness_pb2.AGENT_MODE_INTERACTIVE)
+    self.assertEqual(
+        config.agent_behavior, localharness_pb2.AGENT_BEHAVIOR_INTERACTIVE
+    )
 
-  def test_subagent_agent_mode_config_produces_valid_proto(self):
-    """Verifies that SubagentCapabilities.agent_mode sets CustomAgent.agent_mode."""
+  def test_subagent_agent_behavior_config_produces_valid_proto(self):
+    """Verifies that SubagentCapabilities.agent_behavior sets CustomAgent.agent_behavior."""
     strategy = self._make_strategy(
         subagents=[
             types.SubagentConfig(
                 name="interactive_subagent",
-                description="A subagent that runs in interactive mode.",
+                description="A subagent that runs in interactive behavior.",
                 model="gemini-2.5-pro",
                 capabilities=types.SubagentCapabilities(
-                    agent_mode=types.AgentMode.INTERACTIVE
+                    agent_behavior=types.AgentBehavior.INTERACTIVE
                 ),
             )
         ]
@@ -1231,9 +1976,65 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
     config = strategy._build_harness_config()
     self.assertLen(config.custom_subagents, 1)
     self.assertEqual(
-        config.custom_subagents[0].agent_mode,
-        localharness_pb2.AGENT_MODE_INTERACTIVE,
+        config.custom_subagents[0].agent_behavior,
+        localharness_pb2.AGENT_BEHAVIOR_INTERACTIVE,
     )
+
+  def test_subagent_minimal_agent_behavior_config_produces_valid_proto(self):
+    """Verifies that SubagentCapabilities.agent_behavior=MINIMAL sets CustomAgent.agent_behavior."""
+    strategy = self._make_strategy(
+        subagents=[
+            types.SubagentConfig(
+                name="minimal_subagent",
+                description="A subagent that runs in minimal behavior.",
+                model="gemini-3.8-flash",
+                capabilities=types.SubagentCapabilities(
+                    agent_behavior=types.AgentBehavior.MINIMAL
+                ),
+            )
+        ]
+    )
+    config = strategy._build_harness_config()
+    self.assertLen(config.custom_subagents, 1)
+    self.assertEqual(
+        config.custom_subagents[0].agent_behavior,
+        localharness_pb2.AGENT_BEHAVIOR_MINIMAL,
+    )
+
+  def test_subagent_model_config_produces_valid_proto(self):
+    """Verifies that SubagentConfig.model string sets CustomAgent.model."""
+    strategy = self._make_strategy(
+        subagents=[
+            types.SubagentConfig(
+                name="flash_subagent",
+                description="A subagent that runs on flash.",
+                model="gemini-2.5-flash",
+            )
+        ]
+    )
+    config = strategy._build_harness_config()
+    self.assertLen(config.custom_subagents, 1)
+    self.assertEqual(
+        config.custom_subagents[0].model.name,
+        "gemini-2.5-flash",
+    )
+
+  def test_subagent_model_rejects_model_target(self):
+    """Verifies SubagentConfig.model rejects a ModelTarget.
+
+    Subagents may only pin a model name; localharness builds a single model API
+    client from the agent-level models, so a per-subagent endpoint cannot be
+    honored and must not be silently dropped.
+    """
+    with self.assertRaises(pydantic.ValidationError):
+      types.SubagentConfig(
+          name="custom_endpoint_subagent",
+          description="A subagent that runs on a custom endpoint.",
+          model=types.ModelTarget(
+              name="gemini-2.5-pro",
+              endpoint=types.GeminiAPIEndpoint(api_key="test-subagent-key"),
+          ),
+      )
 
   def test_legacy_shorthands_api_key_produces_valid_proto(self):
     """Verifies that the legacy api_key shorthand translates to the models proto."""
@@ -1309,14 +2110,14 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
     """Verifies that None fields on ModelConfig are not set on the proto."""
     models = [
         types.ModelTarget(
-            name="gemini-3.6-flash",
+            name="gemini-3.8-flash",
             types=[types.ModelType.TEXT],
             endpoint=types.GeminiAPIEndpoint(),
         )
     ]
     strategy = self._make_strategy(models=models)
     config = strategy._build_harness_config()
-    self.assertEqual(config.models[0].name, "gemini-3.6-flash")
+    self.assertEqual(config.models[0].name, "gemini-3.8-flash")
     # api_key should not be set (proto default empty string).
     self.assertEqual(config.models[0].gemini_api_endpoint.api_key, "")
 
@@ -1508,6 +2309,7 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
         capabilities_config=types.CapabilitiesConfig(
             disabled_tools=[
                 types.BuiltinTools.RUN_COMMAND,
+                types.BuiltinTools.SCHEDULE,
                 types.BuiltinTools.ASK_QUESTION,
                 types.BuiltinTools.GENERATE_IMAGE,
             ],
@@ -1515,18 +2317,37 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
     )
     config = strategy._build_harness_config()
     self.assertFalse(config.harness_side_tools.run_command.enabled)
+    self.assertFalse(config.harness_side_tools.schedule.enabled)
+    self.assertFalse(config.harness_side_tools.manage_task.enabled)
     self.assertFalse(config.harness_side_tools.user_questions.enabled)
     self.assertFalse(config.harness_side_tools.generate_image.enabled)
     # Subagents were not disabled; should still be enabled by default.
     self.assertTrue(config.harness_side_tools.subagents.enabled)
-    # Tools that were not disabled should still be enabled.
-    self.assertTrue(config.harness_side_tools.find.enabled)
+    # Tools that were not disabled should still be enabled (except
+    # off-by-default tools).
+    self.assertFalse(config.harness_side_tools.find.enabled)
     self.assertTrue(config.harness_side_tools.file_edit.enabled)
     self.assertTrue(config.harness_side_tools.view_file.enabled)
     self.assertTrue(config.harness_side_tools.write_to_file.enabled)
-    self.assertTrue(config.harness_side_tools.grep_search.enabled)
-    self.assertTrue(config.harness_side_tools.list_dir.enabled)
+    self.assertFalse(config.harness_side_tools.grep_search.enabled)
+    self.assertFalse(config.harness_side_tools.list_dir.enabled)
     self.assertTrue(config.harness_side_tools.search_web.enabled)
+
+  def test_capabilities_config_disabled_tools_preserves_ask_question_disabled(
+      self,
+  ):
+    """Verifies that disabling other tools leaves ASK_QUESTION disabled."""
+    strategy = self._make_strategy(
+        capabilities_config=types.CapabilitiesConfig(
+            disabled_tools=[types.BuiltinTools.RUN_COMMAND],
+        )
+    )
+    config = strategy._build_harness_config()
+    self.assertFalse(config.harness_side_tools.run_command.enabled)
+    self.assertTrue(config.harness_side_tools.schedule.enabled)
+    self.assertTrue(config.harness_side_tools.manage_task.enabled)
+    self.assertFalse(config.harness_side_tools.user_questions.enabled)
+    self.assertTrue(config.harness_side_tools.view_file.enabled)
     self.assertTrue(config.harness_side_tools.read_url_content.enabled)
 
   def test_capabilities_config_enabled_tools(self):
@@ -1547,7 +2368,14 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
         view_file=localharness_pb2.ViewFileToolConfig(enabled=True),
         subagents=localharness_pb2.SubagentsConfig(enabled=False),
         user_questions=localharness_pb2.UserQuestionsConfig(enabled=False),
-        run_command=localharness_pb2.RunCommandToolConfig(enabled=False),
+        run_command=localharness_pb2.RunCommandToolConfig(
+            enabled=False,
+            enable_daemon_commands=False,
+            max_timeout_ms=0,
+            enable_sandbox=False,
+        ),
+        manage_task=localharness_pb2.ManageTaskToolConfig(enabled=False),
+        schedule=localharness_pb2.ScheduleToolConfig(enabled=False),
         find=localharness_pb2.FindToolConfig(enabled=False),
         generate_image=localharness_pb2.GenerateImageToolConfig(enabled=False),
         file_edit=localharness_pb2.FileEditToolConfig(enabled=False),
@@ -1562,6 +2390,117 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
 
     self.assertEqual(config.harness_side_tools, expected_harness_side_tools)
 
+  def test_capabilities_config_run_command_custom(self):
+    """Verifies RunCommandConfig maps to RunCommandToolConfig."""
+    strategy_custom = self._make_strategy(
+        capabilities_config=types.CapabilitiesConfig(
+            run_command_config=types.RunCommandConfig(
+                enable_daemons=False,
+                timeout_seconds=60.0,
+            ),
+        )
+    )
+    config_custom = strategy_custom._build_harness_config()
+    self.assertFalse(
+        config_custom.harness_side_tools.run_command.enable_daemon_commands
+    )
+    self.assertEqual(
+        config_custom.harness_side_tools.run_command.max_timeout_ms,
+        60_000,
+    )
+
+    strategy_true = self._make_strategy(
+        capabilities_config=types.CapabilitiesConfig(
+            run_command_config=types.RunCommandConfig(
+                enable_daemons=True,
+                timeout_seconds=None,
+            ),
+        )
+    )
+    config_true = strategy_true._build_harness_config()
+    self.assertTrue(
+        config_true.harness_side_tools.run_command.enable_daemon_commands
+    )
+    self.assertEqual(
+        config_true.harness_side_tools.run_command.max_timeout_ms,
+        0,
+    )
+
+  def test_build_harness_config_defaults_run_command(self):
+    """Verifies run_command defaults when capabilities_config is None or has no RunCommandConfig."""
+    strategy = self._make_strategy(capabilities_config=None)
+    config = strategy._build_harness_config()
+    self.assertFalse(
+        config.harness_side_tools.run_command.enable_daemon_commands
+    )
+    self.assertEqual(
+        config.harness_side_tools.run_command.max_timeout_ms,
+        0,
+    )
+
+  def test_capabilities_config_run_command_sandbox_forwarded(self):
+    """Verifies the OS-sandbox opt-in maps onto RunCommandToolConfig.
+
+    Why: The ACP server sets run_command_config.enable_sandbox to honor the
+    enterprise PROCEED_IN_SANDBOX / sandbox_mode admin controls; it must reach
+    the harness/cortex over the wire.
+    """
+    strategy = self._make_strategy(
+        capabilities_config=types.CapabilitiesConfig(
+            run_command_config=types.RunCommandConfig(enable_sandbox=True),
+        )
+    )
+    config = strategy._build_harness_config()
+
+    run_command = config.harness_side_tools.run_command
+    self.assertTrue(run_command.enabled)
+    self.assertTrue(run_command.enable_sandbox)
+
+  def test_capabilities_config_run_command_sandbox_defaults_off(self):
+    strategy = self._make_strategy(
+        capabilities_config=types.CapabilitiesConfig()
+    )
+    config = strategy._build_harness_config()
+
+    run_command = config.harness_side_tools.run_command
+    self.assertFalse(run_command.enable_sandbox)
+
+  def test_capabilities_config_max_subagent_depth_and_allowed_subagents(self):
+    """Verifies max_subagent_depth and allowed_subagents map to SubagentsConfig."""
+    strategy = self._make_strategy(
+        capabilities_config=types.CapabilitiesConfig(
+            max_subagent_depth=3,
+            allowed_subagents=["researcher", "reviewer"],
+        )
+    )
+    config = strategy._build_harness_config()
+    self.assertTrue(config.harness_side_tools.subagents.enabled)
+    self.assertEqual(config.harness_side_tools.subagents.max_nesting_depth, 3)
+    self.assertEqual(
+        list(config.harness_side_tools.subagents.allowed_subagents),
+        ["researcher", "reviewer"],
+    )
+
+  def test_build_custom_subagents_protos_nested_subagent_enabled(self):
+    """Verifies custom subagents can have subagents enabled and scoped."""
+    child_subagent = types.SubagentConfig(
+        name="researcher",
+        description="Does research",
+        capabilities=types.SubagentCapabilities(
+            enabled_tools=[types.BuiltinTools.START_SUBAGENT],
+            allowed_subagents=["fact_checker"],
+        ),
+    )
+    strategy = self._make_strategy(subagents=[child_subagent])
+    custom_agents = strategy._build_custom_subagents_protos({})
+    self.assertLen(custom_agents, 1)
+    self.assertEqual(custom_agents[0].name, "researcher")
+    self.assertTrue(custom_agents[0].harness_side_tools.subagents.enabled)
+    self.assertEqual(
+        list(custom_agents[0].harness_side_tools.subagents.allowed_subagents),
+        ["fact_checker"],
+    )
+
   def test_capabilities_config_compaction_threshold(self):
     """Verifies compaction_threshold maps to HarnessConfig.compaction_threshold.
 
@@ -1573,21 +2512,98 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
     )
     config = strategy._build_harness_config()
     self.assertEqual(config.compaction_threshold, 50000)
+    self.assertTrue(config.HasField("compaction_config"))
+    self.assertEqual(config.compaction_config.token_threshold, 50000)
 
   def test_capabilities_config_none_uses_defaults(self):
     """Verifies that capabilities_config=None produces default-enabled tools.
 
-    Why: The most common case is no explicit CapabilitiesConfig; all tools
-    should be enabled and compaction_threshold unset.
+    Why: The most common case is no explicit CapabilitiesConfig; default tools
+    should be enabled (except user_questions) and compaction_threshold unset.
     How: Build with no capabilities_config and assert defaults.
     """
     strategy = self._make_strategy()
     config = strategy._build_harness_config()
     self.assertTrue(config.harness_side_tools.subagents.enabled)
-    self.assertTrue(config.harness_side_tools.user_questions.enabled)
+    self.assertFalse(config.harness_side_tools.user_questions.enabled)
     self.assertTrue(config.harness_side_tools.run_command.enabled)
-    self.assertTrue(config.harness_side_tools.find.enabled)
+    self.assertFalse(config.harness_side_tools.find.enabled)
+    self.assertFalse(config.harness_side_tools.grep_search.enabled)
     self.assertEqual(config.compaction_threshold, 0)
+    self.assertFalse(config.HasField("compaction_config"))
+
+  def test_default_local_agent_config_emits_no_deprecation_warning(self):
+    """Verifies default LocalAgentConfig and CapabilitiesConfig emit no DeprecationWarning."""
+    with warnings.catch_warnings(record=True) as w:
+      warnings.simplefilter("always")
+      agent_cfg = local_connection_config.LocalAgentConfig()
+      strategy = self._make_strategy(capabilities_config=agent_cfg.capabilities)
+      _ = strategy._build_harness_config()
+      compaction_warnings = [
+          item
+          for item in w
+          if issubclass(item.category, DeprecationWarning)
+          and "compaction_threshold" in str(item.message)
+      ]
+      self.assertEqual(compaction_warnings, [])
+
+  def test_capabilities_config_explicit_ask_question_enabled(self):
+    """Verifies that explicitly enabling ASK_QUESTION sets user_questions.enabled."""
+    strategy = self._make_strategy(
+        capabilities_config=types.CapabilitiesConfig(
+            agent_behavior=types.AgentBehavior.INTERACTIVE,
+            enabled_tools=[
+                types.BuiltinTools.VIEW_FILE,
+                types.BuiltinTools.ASK_QUESTION,
+            ],
+        )
+    )
+    config = strategy._build_harness_config()
+    self.assertTrue(config.harness_side_tools.user_questions.enabled)
+    self.assertTrue(config.harness_side_tools.view_file.enabled)
+    self.assertFalse(config.harness_side_tools.run_command.enabled)
+
+  def test_capabilities_config_explicit_find_and_search_enabled(self):
+    """Verifies that explicitly enabling FIND_FILE and SEARCH_DIR enables find and grep_search."""
+    strategy = self._make_strategy(
+        capabilities_config=types.CapabilitiesConfig(
+            enabled_tools=[
+                types.BuiltinTools.FIND_FILE,
+                types.BuiltinTools.SEARCH_DIR,
+            ],
+        )
+    )
+    config = strategy._build_harness_config()
+    self.assertTrue(config.harness_side_tools.find.enabled)
+    self.assertTrue(config.harness_side_tools.grep_search.enabled)
+    self.assertFalse(config.harness_side_tools.run_command.enabled)
+
+  def test_compaction_config_explicit(self):
+    """Verifies CompactionConfig maps to HarnessConfig.compaction_config."""
+    strategy = self._make_strategy(
+        compaction_config=types.CompactionConfig(
+            token_threshold=40000
+        )
+    )
+    config = strategy._build_harness_config()
+    self.assertEqual(config.compaction_threshold, 40000)
+    self.assertTrue(config.HasField("compaction_config"))
+    self.assertEqual(config.compaction_config.token_threshold, 40000)
+
+  def test_compaction_config_precedence_over_capabilities(self):
+    """Verifies that compaction_config takes precedence over CapabilitiesConfig."""
+    strategy = self._make_strategy(
+        capabilities_config=types.CapabilitiesConfig(
+            compaction_threshold=50000
+        ),
+        compaction_config=types.CompactionConfig(
+            token_threshold=30000
+        ),
+    )
+    config = strategy._build_harness_config()
+    self.assertEqual(config.compaction_threshold, 30000)
+    self.assertTrue(config.HasField("compaction_config"))
+    self.assertEqual(config.compaction_config.token_threshold, 30000)
 
   def test_cascade_id_passed_through(self):
     """Verifies that session_config.conversation_id maps to HarnessConfig.cascade_id.
@@ -1680,14 +2696,14 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
     """
     strategy = self._make_strategy()
     config = strategy._build_harness_config()
-    self.assertEqual(len(config.workspaces), 0)
+    self.assertEmpty(config.workspaces)
 
   def test_models_thinking_level_set(self):
     """Verifies that thinking_level on ModelTarget maps to the proto field."""
     strategy = self._make_strategy(
         models=[
             types.ModelTarget(
-                name=DEFAULT_MODEL,
+                name=models_lib.DEFAULT_MODEL,
                 types=[types.ModelType.TEXT],
                 endpoint=types.GeminiAPIEndpoint(
                     options=types.GeminiModelOptions(
@@ -1707,7 +2723,7 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
     strategy = self._make_strategy(
         models=[
             types.ModelTarget(
-                name=DEFAULT_MODEL,
+                name=models_lib.DEFAULT_MODEL,
                 types=[types.ModelType.TEXT],
                 endpoint=types.GeminiAPIEndpoint(
                     options=types.GeminiModelOptions(thinking_level=None),
@@ -1724,7 +2740,7 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
       strategy = self._make_strategy(
           models=[
               types.ModelTarget(
-                  name=DEFAULT_MODEL,
+                  name=models_lib.DEFAULT_MODEL,
                   types=[types.ModelType.TEXT],
                   endpoint=types.GeminiAPIEndpoint(
                       options=types.GeminiModelOptions(thinking_level=level),
@@ -1745,7 +2761,7 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
     strategy = self._make_strategy(
         models=[
             types.ModelTarget(
-                name=DEFAULT_MODEL,
+                name=models_lib.DEFAULT_MODEL,
                 types=[types.ModelType.TEXT],
                 endpoint=types.GeminiAPIEndpoint(
                     options=types.GeminiModelOptions(
@@ -1765,7 +2781,7 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
     strategy = self._make_strategy(
         models=[
             types.ModelTarget(
-                name=DEFAULT_MODEL,
+                name=models_lib.DEFAULT_MODEL,
                 types=[types.ModelType.TEXT],
                 endpoint=types.GeminiAPIEndpoint(
                     options=types.GeminiModelOptions(service_tier=None),
@@ -1782,7 +2798,7 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
       strategy = self._make_strategy(
           models=[
               types.ModelTarget(
-                  name=DEFAULT_MODEL,
+                  name=models_lib.DEFAULT_MODEL,
                   types=[types.ModelType.TEXT],
                   endpoint=types.GeminiAPIEndpoint(
                       options=types.GeminiModelOptions(service_tier=tier),
@@ -1802,7 +2818,7 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
     strategy = self._make_strategy(
         models=[
             types.ModelTarget(
-                name=DEFAULT_MODEL,
+                name=models_lib.DEFAULT_MODEL,
                 types=[types.ModelType.TEXT],
                 endpoint=types.VertexEndpoint(
                     project="test-project",
@@ -1823,7 +2839,7 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
     """Verifies that Vertex configuration fields propagate to proto."""
     models = [
         types.ModelTarget(
-            name="gemini-3.6-flash",
+            name="gemini-3.8-flash",
             types=[types.ModelType.TEXT],
             endpoint=types.VertexEndpoint(
                 project="my-project",
@@ -1952,7 +2968,7 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
     )
     config = strategy._build_harness_config()
     self.assertEqual(config.cascade_id, "session-789")
-    self.assertEqual(len(config.workspaces), 1)
+    self.assertLen(config.workspaces, 1)
     self.assertEqual(
         config.workspaces[0].filesystem_workspace.directory, "/ws/a"
     )
@@ -2000,7 +3016,121 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
         workspaces=["file:///dev/shm/workspace", "/tmp/clean-path"]
     )
     self.assertEqual(
-        strategy._workspaces, ["/dev/shm/workspace", "/tmp/clean-path"]
+        strategy._workspaces,
+        ["/dev/shm/workspace", str(pathlib.Path("/tmp/clean-path").resolve())],
+    )
+
+  def test_strategy_normalizes_relative_workspaces(self):
+    """Verifies that relative workspace paths and user home ~ are resolved."""
+    strategy = self._make_strategy(
+        workspaces=["ws", "./subdir", "../parent", "~/my_project"]
+    )
+    expected = [
+        str(pathlib.Path("ws").resolve()),
+        str(pathlib.Path("./subdir").resolve()),
+        str(pathlib.Path("../parent").resolve()),
+        str(pathlib.Path("~/my_project").expanduser().resolve()),
+    ]
+    self.assertEqual(strategy._workspaces, expected)
+    config = strategy._build_harness_config()
+    self.assertLen(config.workspaces, 4)
+    for i, exp in enumerate(expected):
+      self.assertEqual(config.workspaces[i].filesystem_workspace.directory, exp)
+
+  def test_strategy_normalizes_pathlib_paths(self):
+    """Verifies that pathlib.Path objects are resolved and accepted."""
+    strategy = self._make_strategy(
+        workspaces=[pathlib.Path("ws"), pathlib.Path("/dev/shm/ws")]
+    )
+    expected = [
+        str(pathlib.Path("ws").resolve()),
+        str(pathlib.Path("/dev/shm/ws").resolve()),
+    ]
+    self.assertEqual(strategy._workspaces, expected)
+
+  def test_strategy_normalizes_cns_workspaces(self):
+    """Verifies that CNS URIs and paths are preserved without filesystem resolve."""
+    strategy = self._make_strategy(
+        workspaces=["cns://el-d/home/user/project", "/cns/el-d/home/user/data"]
+    )
+    expected = [
+        "/cns/el-d/home/user/project",
+        "/cns/el-d/home/user/data",
+    ]
+    self.assertEqual(strategy._workspaces, expected)
+    config = strategy._build_harness_config()
+    self.assertEqual(
+        config.workspaces[0].filesystem_workspace.directory,
+        "/cns/el-d/home/user/project",
+    )
+    self.assertEqual(
+        config.workspaces[1].filesystem_workspace.directory,
+        "/cns/el-d/home/user/data",
+    )
+
+  def test_local_agent_config_workspaces_validation(self):
+    """Verifies LocalAgentConfig validation, coercion, and normalization of workspaces."""
+    # Default is [os.getcwd()]
+    cfg_default = local_connection_config.LocalAgentConfig()
+    self.assertEqual(cfg_default.workspaces, [os.getcwd()])
+
+    # Explicit empty list is preserved
+    cfg_empty = local_connection_config.LocalAgentConfig(workspaces=[])
+    self.assertEqual(cfg_empty.workspaces, [])
+
+    # Single string is coerced and normalized
+    cfg_str = local_connection_config.LocalAgentConfig(workspaces="ws")
+    self.assertEqual(cfg_str.workspaces, [str(pathlib.Path("ws").resolve())])
+
+    # Single Path is coerced and normalized
+    cfg_path = local_connection_config.LocalAgentConfig(
+        workspaces=pathlib.Path("ws")
+    )
+    self.assertEqual(cfg_path.workspaces, [str(pathlib.Path("ws").resolve())])
+
+    # List of relative paths and ~
+    cfg_list = local_connection_config.LocalAgentConfig(
+        workspaces=["ws", "./nested", "~/my_project"]
+    )
+    self.assertEqual(
+        cfg_list.workspaces,
+        [
+            str(pathlib.Path("ws").resolve()),
+            str(pathlib.Path("./nested").resolve()),
+            str(pathlib.Path("~/my_project").expanduser().resolve()),
+        ],
+    )
+
+    # URIs
+    cfg_uris = local_connection_config.LocalAgentConfig(
+        workspaces=["file:///dev/shm/ws", "cns://el-d/home/user/ws"]
+    )
+    self.assertEqual(
+        cfg_uris.workspaces,
+        ["/dev/shm/ws", "/cns/el-d/home/user/ws"],
+    )
+
+    # Invalid types raise ValidationError
+    with self.assertRaises(pydantic.ValidationError):
+      local_connection_config.LocalAgentConfig(
+          workspaces=typing.cast(typing.Any, 123)
+      )
+
+    with self.assertRaises(pydantic.ValidationError):
+      local_connection_config.LocalAgentConfig(
+          workspaces=typing.cast(typing.Any, {"invalid": "type"})
+      )
+
+  def test_strategy_normalizes_single_workspace_input(self):
+    """Verifies that a single string or PathLike passed to strategy is normalized."""
+    strategy_str = self._make_strategy(workspaces="ws")
+    self.assertEqual(
+        strategy_str._workspaces, [str(pathlib.Path("ws").resolve())]
+    )
+
+    strategy_path = self._make_strategy(workspaces=pathlib.Path("ws"))
+    self.assertEqual(
+        strategy_path._workspaces, [str(pathlib.Path("ws").resolve())]
     )
 
   def test_mcp_servers_propagated(self):
@@ -2053,6 +3183,164 @@ class LocalConnectionStrategyConfigTest(parameterized.TestCase):
     strategy_empty = self._make_strategy(retry_config=types.RetryConfig())
     config_empty = strategy_empty._build_harness_config()
     self.assertFalse(config_empty.HasField("retry_config"))
+
+  def test_budget_config_proto(self):
+    """Verifies that budget_config translates to proto correctly."""
+    strategy_none = self._make_strategy(budget_config=None)
+    config_none = strategy_none._build_harness_config()
+    self.assertFalse(config_none.HasField("budget_config"))
+
+    strategy_empty = self._make_strategy(budget_config=types.BudgetConfig())
+    config_empty = strategy_empty._build_harness_config()
+    self.assertFalse(config_empty.HasField("budget_config"))
+
+    budget_cfg = types.BudgetConfig(
+        max_model_calls=5,
+        max_tool_calls=10,
+        max_input_tokens=500,
+        max_output_tokens=200,
+        max_total_tokens=1000,
+    )
+    strategy = self._make_strategy(budget_config=budget_cfg)
+    config = strategy._build_harness_config()
+    self.assertTrue(config.HasField("budget_config"))
+    self.assertEqual(config.budget_config.max_model_calls, 5)
+    self.assertEqual(config.budget_config.max_tool_calls, 10)
+    self.assertEqual(config.budget_config.max_input_tokens, 500)
+    self.assertEqual(config.budget_config.max_output_tokens, 200)
+    self.assertEqual(config.budget_config.max_total_tokens, 1000)
+    self.assertEqual(
+        config.budget_config.scope,
+        localharness_pb2.BudgetConfig.BUDGET_SCOPE_LIFETIME,
+    )
+
+    budget_cfg_lifetime = types.BudgetConfig(
+        max_total_tokens=1000,
+        scope=types.BudgetScope.LIFETIME,
+    )
+    strategy_lifetime = self._make_strategy(budget_config=budget_cfg_lifetime)
+    config_lifetime = strategy_lifetime._build_harness_config()
+    self.assertTrue(config_lifetime.HasField("budget_config"))
+    self.assertEqual(
+        config_lifetime.budget_config.scope,
+        localharness_pb2.BudgetConfig.BUDGET_SCOPE_LIFETIME,
+    )
+
+    budget_cfg_forward = types.BudgetConfig(
+        max_total_tokens=2000,
+        scope=types.BudgetScope.FORWARD_LOOKING,
+    )
+    strategy_forward = self._make_strategy(budget_config=budget_cfg_forward)
+    config_forward = strategy_forward._build_harness_config()
+    self.assertTrue(config_forward.HasField("budget_config"))
+    self.assertEqual(config_forward.budget_config.max_total_tokens, 2000)
+    self.assertEqual(
+        config_forward.budget_config.scope,
+        localharness_pb2.BudgetConfig.BUDGET_SCOPE_FORWARD_LOOKING,
+    )
+
+    # Test direct helper with normalized inputs
+    self.assertIsNone(
+        local_connection.build_budget_config_proto(None)
+    )
+    self.assertIsNone(
+        local_connection.build_budget_config_proto(types.BudgetConfig())
+    )
+
+  def test_tool_output_truncation_proto(self):
+    """Verifies that tool_output_truncation_config translates to proto correctly."""
+    strategy_none = self._make_strategy(
+        capabilities_config=types.CapabilitiesConfig(
+            tool_output_truncation_config=None
+        )
+    )
+    config_none = strategy_none._build_harness_config()
+    self.assertFalse(config_none.HasField("tool_output_truncation"))
+
+    # Integer shorthand defaults to truncate strategy
+    strategy_int = self._make_strategy(
+        capabilities_config=types.CapabilitiesConfig(
+            tool_output_truncation_config=2048
+        )
+    )
+    config_int = strategy_int._build_harness_config()
+    self.assertTrue(config_int.HasField("tool_output_truncation"))
+    self.assertTrue(config_int.tool_output_truncation.HasField("truncate"))
+    self.assertEqual(
+        config_int.tool_output_truncation.truncate.max_tokens, 2048
+    )
+
+    # Integer shorthand 0 (explicitly disables truncation)
+    strategy_zero = self._make_strategy(
+        capabilities_config=types.CapabilitiesConfig(
+            tool_output_truncation_config=0
+        )
+    )
+    config_zero = strategy_zero._build_harness_config()
+    self.assertTrue(config_zero.HasField("tool_output_truncation"))
+    self.assertTrue(config_zero.tool_output_truncation.HasField("truncate"))
+    self.assertEqual(config_zero.tool_output_truncation.truncate.max_tokens, 0)
+
+    # Explicit ToolOutputTruncationConfig
+    trunc_cfg = types.ToolOutputTruncationConfig(max_tokens=1500)
+    strategy_trunc = self._make_strategy(
+        capabilities_config=types.CapabilitiesConfig(
+            tool_output_truncation_config=trunc_cfg
+        )
+    )
+    config_trunc = strategy_trunc._build_harness_config()
+    self.assertTrue(config_trunc.HasField("tool_output_truncation"))
+    self.assertTrue(config_trunc.tool_output_truncation.HasField("truncate"))
+    self.assertEqual(
+        config_trunc.tool_output_truncation.truncate.max_tokens, 1500
+    )
+
+    # Explicit ToolOutputTruncationConfig with 0
+    trunc_zero_cfg = types.ToolOutputTruncationConfig(max_tokens=0)
+    strategy_trunc_zero = self._make_strategy(
+        capabilities_config=types.CapabilitiesConfig(
+            tool_output_truncation_config=trunc_zero_cfg
+        )
+    )
+    config_trunc_zero = strategy_trunc_zero._build_harness_config()
+    self.assertTrue(config_trunc_zero.HasField("tool_output_truncation"))
+    self.assertTrue(
+        config_trunc_zero.tool_output_truncation.HasField("truncate")
+    )
+    self.assertEqual(
+        config_trunc_zero.tool_output_truncation.truncate.max_tokens, 0
+    )
+
+    # Test direct helper
+    self.assertIsNone(local_connection.build_tool_output_truncation_proto(None))
+    proto_zero = local_connection.build_tool_output_truncation_proto(
+        types.ToolOutputTruncationConfig(max_tokens=0)
+    )
+    self.assertIsNotNone(proto_zero)
+    self.assertEqual(proto_zero.truncate.max_tokens, 0)
+
+  def test_local_agent_config_tool_output_truncation(self):
+    """Verifies that LocalAgentConfig passes tool_output_truncation_config in capabilities to strategy."""
+    agent_cfg = local_connection_config.LocalAgentConfig(
+        capabilities=types.CapabilitiesConfig(
+            tool_output_truncation_config=1024
+        )
+    )
+    self.assertEqual(
+        agent_cfg.capabilities.tool_output_truncation_config,
+        types.ToolOutputTruncationConfig(max_tokens=1024),
+    )
+    strategy = agent_cfg.create_strategy(tool_runner=None, hook_runner=None)
+    self.assertIsInstance(strategy, local_connection.LocalConnectionStrategy)
+    self.assertEqual(
+        strategy._capabilities_config.tool_output_truncation_config,
+        types.ToolOutputTruncationConfig(max_tokens=1024),
+    )
+    harness_cfg = strategy._build_harness_config()
+    self.assertTrue(harness_cfg.HasField("tool_output_truncation"))
+    self.assertEqual(
+        harness_cfg.tool_output_truncation.truncate.max_tokens, 1024
+    )
 
   def test_retry_config_api_retry_only(self):
     """Verifies translation when only api_retry is configured."""
@@ -2164,12 +3452,7 @@ class LocalConnectionStrategyApiKeyTest(unittest.IsolatedAsyncioTestCase):
 
   def setUp(self):
     super().setUp()
-    self.patcher = mock.patch(
-        "google.antigravity.connections.local.local_connection._get_default_binary_path",
-        return_value="/fake/binary",
-    )
-    self.patcher.start()
-    self.addCleanup(self.patcher.stop)
+    test_utils.patch_default_binary_path(self)
 
   def _make_strategy(self, **kwargs):
     """Creates a LocalConnectionStrategy with the given kwargs."""
@@ -2186,7 +3469,7 @@ class LocalConnectionStrategyApiKeyTest(unittest.IsolatedAsyncioTestCase):
     """
     models = [
         types.ModelTarget(
-            name="gemini-3.6-flash",
+            name="gemini-3.8-flash",
             types=[types.ModelType.TEXT],
         )
     ]
@@ -2204,7 +3487,7 @@ class LocalConnectionStrategyApiKeyTest(unittest.IsolatedAsyncioTestCase):
     """
     models = [
         types.ModelTarget(
-            name="gemini-3.6-flash",
+            name="gemini-3.8-flash",
             types=[types.ModelType.TEXT],
             endpoint=types.GeminiAPIEndpoint(api_key=None),
         )
@@ -2220,7 +3503,7 @@ class LocalConnectionStrategyApiKeyTest(unittest.IsolatedAsyncioTestCase):
     """Verifies strategy raises validation error when Vertex is set but no project/location provided."""
     models = [
         types.ModelTarget(
-            name="gemini-3.6-flash",
+            name="gemini-3.8-flash",
             types=[types.ModelType.TEXT],
             endpoint=types.VertexEndpoint(project=None, location=None),
         )
@@ -2229,7 +3512,10 @@ class LocalConnectionStrategyApiKeyTest(unittest.IsolatedAsyncioTestCase):
     with self.assertRaises(types.AntigravityValidationError) as ctx:
       async with strategy:
         pass
-    self.assertIn("project and location must be set", str(ctx.exception))
+    self.assertIn(
+        "either (project and location) or api_key must be set",
+        str(ctx.exception),
+    )
 
   @mock.patch.dict("os.environ", {}, clear=True)
   @mock.patch("subprocess.Popen")
@@ -2244,7 +3530,7 @@ class LocalConnectionStrategyApiKeyTest(unittest.IsolatedAsyncioTestCase):
 
     models = [
         types.ModelTarget(
-            name="gemini-3.6-flash",
+            name="gemini-3.8-flash",
             types=[types.ModelType.TEXT],
             endpoint=types.VertexEndpoint(
                 project="my-project",
@@ -2276,7 +3562,7 @@ class LocalConnectionStrategyApiKeyTest(unittest.IsolatedAsyncioTestCase):
     mock_proc.stdout.read.return_value = b""
     mock_popen.return_value = mock_proc
 
-    cfg = local_connection_config.LocalAgentConfig(model="gemini-3.6-flash")
+    cfg = local_connection_config.LocalAgentConfig(model="gemini-3.8-flash")
     self.assertIsInstance(cfg.models[0].endpoint, types.VertexEndpoint)
     self.assertEqual(cfg.models[0].endpoint.project, "env-project")
     self.assertEqual(cfg.models[0].endpoint.location, "env-location")
@@ -2290,7 +3576,7 @@ class LocalConnectionStrategyApiKeyTest(unittest.IsolatedAsyncioTestCase):
   )
   def test_bare_config_routes_to_vertex_via_use_enterprise_env(self):
     """USE_ENTERPRISE alone also triggers Vertex routing (GEAP recipe)."""
-    cfg = local_connection_config.LocalAgentConfig(model="gemini-3.6-flash")
+    cfg = local_connection_config.LocalAgentConfig(model="gemini-3.8-flash")
     self.assertIsInstance(cfg.models[0].endpoint, types.VertexEndpoint)
 
   @mock.patch.dict(
@@ -2306,6 +3592,98 @@ class LocalConnectionStrategyApiKeyTest(unittest.IsolatedAsyncioTestCase):
     ep = types.VertexEndpoint()
     self.assertEqual(ep.project, "env-project")
     self.assertEqual(ep.location, "env-location")
+
+  @mock.patch.dict(
+      "os.environ",
+      {
+          "GOOGLE_CLOUD_PROJECT": "env-project",
+          "GOOGLE_CLOUD_LOCATION": "env-location",
+      },
+      clear=True,
+  )
+  def test_vertex_endpoint_api_key_skips_env_hydration(self):
+    """VertexEndpoint(api_key=...) skips hydrating project and location from env."""
+    ep = types.VertexEndpoint(api_key="express-key")
+    self.assertEqual(ep.api_key, "express-key")
+    self.assertIsNone(ep.project)
+    self.assertIsNone(ep.location)
+    ep.validate_endpoint()
+
+  @mock.patch.dict(
+      "os.environ",
+      {
+          "GOOGLE_CLOUD_PROJECT": "env-project",
+          "GOOGLE_CLOUD_LOCATION": "env-location",
+      },
+      clear=True,
+  )
+  def test_vertex_endpoint_base_url_skips_env_hydration(self):
+    """VertexEndpoint(base_url=...) skips hydrating project and location from env."""
+    ep = types.VertexEndpoint(base_url="http://localhost:8080")
+    self.assertEqual(ep.base_url, "http://localhost:8080")
+    self.assertIsNone(ep.project)
+    self.assertIsNone(ep.location)
+    self.assertIsNone(ep.api_key)
+    ep.validate_endpoint()
+
+  def test_vertex_endpoint_base_url_allows_custom_auth_and_routing(self):
+    """VertexEndpoint allows custom project/location and api_key when base_url is set."""
+    ep = types.VertexEndpoint(
+        base_url="https://gateway.example.com/vertex",
+        project="my-proj",
+        location="us-central1",
+        api_key="gateway-key",
+        http_headers={"Authorization": "Bearer token"},
+    )
+    self.assertEqual(ep.base_url, "https://gateway.example.com/vertex")
+    self.assertEqual(ep.project, "my-proj")
+    self.assertEqual(ep.location, "us-central1")
+    self.assertEqual(ep.api_key, "gateway-key")
+    ep.validate_endpoint()
+
+  def test_vertex_endpoint_mutual_exclusivity(self):
+    """VertexEndpoint raises ValueError when both api_key and project/location are set without base_url."""
+    ep_both = types.VertexEndpoint(
+        project="my-proj", location="us-central1", api_key="express-key"
+    )
+    with self.assertRaisesRegex(ValueError, "Cannot specify both api_key"):
+      ep_both.validate_endpoint()
+
+    ep_proj = types.VertexEndpoint(project="my-proj", api_key="express-key")
+    with self.assertRaisesRegex(ValueError, "Cannot specify both api_key"):
+      ep_proj.validate_endpoint()
+
+    ep_loc = types.VertexEndpoint(location="us-central1", api_key="express-key")
+    with self.assertRaisesRegex(ValueError, "Cannot specify both api_key"):
+      ep_loc.validate_endpoint()
+
+  @mock.patch.dict("os.environ", {}, clear=True)
+  def test_vertex_shorthand_forwards_api_key(self):
+    """LocalAgentConfig(vertex=True, api_key=...) constructs Express mode VertexEndpoint."""
+    cfg = local_connection_config.LocalAgentConfig(
+        vertex=True, api_key="express-key"
+    )
+    self.assertIsInstance(cfg.models[0].endpoint, types.VertexEndpoint)
+    self.assertEqual(cfg.models[0].endpoint.api_key, "express-key")
+    self.assertIsNone(cfg.models[0].endpoint.project)
+    self.assertIsNone(cfg.models[0].endpoint.location)
+    cfg.models[0].endpoint.validate_endpoint()
+
+  @mock.patch.dict("os.environ", {}, clear=True)
+  def test_vertex_express_config_propagates_to_harness_proto(self):
+    """Verifies that api_key on VertexEndpoint propagates to localharness proto."""
+    models = [
+        types.ModelTarget(
+            name="gemini-3.8-flash",
+            types=[types.ModelType.TEXT],
+            endpoint=types.VertexEndpoint(api_key="express-key"),
+        )
+    ]
+    strategy = self._make_strategy(models=models)
+    config_proto = strategy._build_harness_config()
+    self.assertEqual(
+        config_proto.models[0].vertex_endpoint.api_key, "express-key"
+    )
 
   @mock.patch.dict("os.environ", {"GEMINI_API_KEY": "env-key"}, clear=True)
   @mock.patch("subprocess.Popen")
@@ -2435,7 +3813,7 @@ class LocalConnectionStrategyApiKeyTest(unittest.IsolatedAsyncioTestCase):
     mock_popen.return_value = mock_proc
     models = [
         types.ModelTarget(
-            name="gemini-3.6-flash",
+            name="gemini-3.8-flash",
             types=[types.ModelType.TEXT],
             endpoint=types.GeminiAPIEndpoint(api_key="explicit-key"),
         )
@@ -2451,12 +3829,7 @@ class LocalConnectionStrategyConnectTest(unittest.IsolatedAsyncioTestCase):
 
   def setUp(self):
     super().setUp()
-    self.patcher = mock.patch(
-        "google.antigravity.connections.local.local_connection._get_default_binary_path",
-        return_value="/fake/binary",
-    )
-    self.patcher.start()
-    self.addCleanup(self.patcher.stop)
+    test_utils.patch_default_binary_path(self)
 
   def _make_strategy(self, **kwargs):
     return local_connection.LocalConnectionStrategy(**kwargs)
@@ -2521,9 +3894,22 @@ _get_default_binary_path = local_connection._get_default_binary_path
 
 class GetDefaultBinaryPathTest(unittest.TestCase):
 
-  @mock.patch.dict("os.environ", {"ANTIGRAVITY_HARNESS_PATH": "/env/path"})
-  def test_returns_env_path(self):
-    path = _get_default_binary_path()
+  @mock.patch.dict(
+      "os.environ",
+      {"ANTIGRAVITY_HARNESS_PATH": "/I/should/not/be/used"},
+  )
+  def test_returns_env_path_via_passed_env(self):
+    path = _get_default_binary_path(
+        env={"ANTIGRAVITY_HARNESS_PATH": "/I/should/be/used"}
+    )
+    self.assertEqual(path, "/I/should/be/used")
+
+  @mock.patch.dict(
+      "os.environ",
+      {"ANTIGRAVITY_HARNESS_PATH": "/env/path"}
+  )
+  def test_returns_env_path_via_global_env(self):
+    path = _get_default_binary_path(env={"not_harness_path": "different_value"})
     self.assertEqual(path, "/env/path")
 
   @mock.patch.dict("os.environ", {}, clear=True)
@@ -2541,7 +3927,7 @@ class GetDefaultBinaryPathTest(unittest.TestCase):
     mock_dist.return_value = mock_distribution
     mock_exists.return_value = True
 
-    path = _get_default_binary_path()
+    path = _get_default_binary_path(env=None)
     self.assertEqual(path, "/site-packages/google/antigravity/bin/localharness")
     mock_dist.assert_called_once_with("google-antigravity")
     mock_file.locate.assert_called_once()
@@ -2559,7 +3945,7 @@ class GetDefaultBinaryPathTest(unittest.TestCase):
     mock_files.return_value = mock_path
     mock_exists.return_value = True
 
-    path = _get_default_binary_path()
+    path = _get_default_binary_path(env={})
     self.assertEqual(path, "/wheel/path")
 
   @mock.patch.dict("os.environ", {}, clear=True)
@@ -2571,7 +3957,7 @@ class GetDefaultBinaryPathTest(unittest.TestCase):
     mock_files.side_effect = ImportError
     mock_which.return_value = "/system/path"
 
-    path = _get_default_binary_path()
+    path = _get_default_binary_path(env={})
     self.assertEqual(path, "/system/path")
     mock_which.assert_called_once_with("localharness")
 
@@ -2585,7 +3971,7 @@ class GetDefaultBinaryPathTest(unittest.TestCase):
     mock_which.return_value = None
 
     with self.assertRaises(RuntimeError) as ctx:
-      _get_default_binary_path()
+      _get_default_binary_path(env={})
     self.assertIn(
         "Could not find default localharness binary", str(ctx.exception)
     )
@@ -2921,7 +4307,8 @@ class LocalConnectionCompactionHookTest(unittest.IsolatedAsyncioTestCase):
 
       async def run(self, context, data):  # pylint: disable=unused-argument
         captured.append(data)
-        event.set()
+        if len(captured) == 1:
+          event.set()
 
     hr = hook_runner.HookRunner()
     hr.register_hook(CompactionHook())
@@ -2932,24 +4319,128 @@ class LocalConnectionCompactionHookTest(unittest.IsolatedAsyncioTestCase):
         hook_runner=hr,
     )
 
-    output_event = localharness_pb2.OutputEvent(
-        step_update=localharness_pb2.StepUpdate(
+    req = localharness_pb2.CallHookRequest(
+        request_id="req_comp_1",
+        name="OnCompaction",
+        type=localharness_pb2.LIFECYCLE_HOOK_ON_COMPACTION,
+        on_compaction_args=localharness_pb2.OnCompactionArgs(
+            trajectory_id="main",
             step_index=1,
-            text="Context compaction",
-            state=localharness_pb2.StepUpdate.STATE_DONE,
-            source=localharness_pb2.StepUpdate.SOURCE_SYSTEM,
-            target=localharness_pb2.StepUpdate.TARGET_USER,
-            compaction=localharness_pb2.ActionCompaction(),
-        )
+            summary="Context compaction",
+        ),
     )
-
+    output_event = localharness_pb2.OutputEvent(call_hook_request=req)
     await harness.send_event(output_event)
-    await asyncio.wait_for(event.wait(), timeout=1.0)
 
+    await asyncio.wait_for(event.wait(), timeout=1.0)
     self.assertEqual(len(captured), 1)
-    self.assertIsInstance(captured[0], local_connection.LocalConnectionStep)
     self.assertEqual(captured[0].type, types.StepType.COMPACTION)
     self.assertEqual(captured[0].content, "Context compaction")
+    self.assertEqual(captured[0].status, types.StepStatus.DONE)
+    self.assertEqual(captured[0].source, types.StepSource.SYSTEM)
+    self.assertEqual(captured[0].target, types.StepTarget.USER)
+    self.assertEqual(captured[0].trajectory_id, "main")
+    self.assertEqual(captured[0].step_index, 1)
+
+    resp = await harness.wait_for_response(timeout=1.0)
+    self.assertIn("callHookResponse", resp)
+    self.assertEqual(resp["callHookResponse"]["requestId"], "req_comp_1")
+    self.assertIn("emptyResult", resp["callHookResponse"])
+
+  def test_get_enabled_hooks_includes_on_compaction(self):
+    """Verifies _get_enabled_hooks includes LIFECYCLE_HOOK_ON_COMPACTION."""
+    hr = hook_runner.HookRunner()
+
+    class CompactionHook(hooks_base.OnCompactionHook):
+
+      async def run(self, context, data):
+        pass
+
+    hr.register_hook(CompactionHook())
+    strategy = local_connection.LocalConnectionStrategy(hook_runner=hr)
+    enabled = strategy._get_enabled_hooks()
+    self.assertIn(localharness_pb2.LIFECYCLE_HOOK_ON_COMPACTION, enabled)
+
+
+class LocalConnectionStopHookTest(unittest.IsolatedAsyncioTestCase):
+  """Tests for Stop lifecycle hook dispatch."""
+
+  def setUp(self):
+    super().setUp()
+    self.mock_process = mock.MagicMock()
+
+  def test_get_enabled_hooks_includes_stop(self):
+    """Verifies _get_enabled_hooks includes LIFECYCLE_HOOK_STOP."""
+    hr = hook_runner.HookRunner()
+
+    class StopHook(hooks_base.StopHook):
+
+      async def run(self, context, data):
+        return types.StopHookResult()
+
+    hr.register_hook(StopHook())
+    strategy = local_connection.LocalConnectionStrategy(hook_runner=hr)
+    enabled = strategy._get_enabled_hooks()
+    self.assertIn(localharness_pb2.LIFECYCLE_HOOK_STOP, enabled)
+
+  async def test_stop_hook_dispatched_via_local_harness(self):
+    """Verifies StopHook fires and returns StopResult over the wire."""
+    captured = []
+    event = asyncio.Event()
+
+    class CustomStopHook(hooks_base.StopHook):
+
+      async def run(self, context, data):
+        captured.append(data)
+        event.set()
+        return types.StopHookResult(
+            decision=types.StopDecision.CONTINUE,
+            reason="Continue working",
+        )
+
+    hr = hook_runner.HookRunner()
+    hr.register_hook(CustomStopHook())
+
+    harness = test_utils.TestLocalHarness(
+        test_case=self,
+        process=self.mock_process,
+        hook_runner=hr,
+    )
+
+    req = localharness_pb2.CallHookRequest(
+        request_id="req_stop_1",
+        name="Stop",
+        type=localharness_pb2.LIFECYCLE_HOOK_STOP,
+        stop_args=localharness_pb2.StopArgs(
+            response_text="Done with task",
+            trajectory_id="main_traj",
+            continuation_count=0,
+            stop_reason=localharness_pb2.TrajectoryStateUpdate.STOP_REASON_UNSPECIFIED,
+            error_message="",
+        ),
+    )
+    output_event = localharness_pb2.OutputEvent(call_hook_request=req)
+    await harness.send_event(output_event)
+
+    await asyncio.wait_for(event.wait(), timeout=1.0)
+    self.assertEqual(len(captured), 1)
+    self.assertEqual(captured[0].response_text, "Done with task")
+    self.assertEqual(captured[0].trajectory_id, "main_traj")
+    self.assertEqual(captured[0].continuation_count, 0)
+    self.assertEqual(captured[0].stop_reason, types.StopReason.UNSPECIFIED)
+
+    resp = await harness.wait_for_response(timeout=1.0)
+    self.assertIn("callHookResponse", resp)
+    self.assertEqual(resp["callHookResponse"]["requestId"], "req_stop_1")
+    self.assertIn("stopResult", resp["callHookResponse"])
+    self.assertEqual(
+        resp["callHookResponse"]["stopResult"]["decision"],
+        "CONTINUE",
+    )
+    self.assertEqual(
+        resp["callHookResponse"]["stopResult"]["reason"],
+        "Continue working",
+    )
 
 
 class LocalConnectionSubagentHookTest(unittest.IsolatedAsyncioTestCase):
@@ -3057,7 +4548,7 @@ class LocalConnectionToolCallHooksTest(unittest.IsolatedAsyncioTestCase):
     """
     tr = tool_runner.ToolRunner()
 
-    async def failing_handler(**kwargs):
+    async def failing_handler(**_):
       raise RuntimeError("Intentional failure")
 
     tr.register(failing_handler, "failing_tool")
@@ -3487,6 +4978,31 @@ class LocalConnectionUnexpectedCloseTest(unittest.IsolatedAsyncioTestCase):
     item = await asyncio.wait_for(conn._step_queue.get(), timeout=2)
     self.assertIsNone(item)
 
+  def test_get_ws_close_code_with_rcvd_code(self):
+    """Verifies close code extraction when rcvd has a code."""
+    rcvd_frame = mock.MagicMock(code=1000)
+    exc = websockets.ConnectionClosed(rcvd=rcvd_frame, sent=None)
+    self.assertEqual(local_connection._get_ws_close_code(exc), 1000)
+
+  def test_get_ws_close_code_with_sent_code(self):
+    """Verifies close code extraction when sent has a code."""
+    sent_frame = mock.MagicMock(code=1001)
+    exc = websockets.ConnectionClosed(rcvd=None, sent=sent_frame)
+    self.assertEqual(local_connection._get_ws_close_code(exc), 1001)
+
+  def test_get_ws_close_code_with_both_none(self):
+    """Verifies close code defaults to 1006 when both rcvd and sent are None."""
+    exc = websockets.ConnectionClosed(rcvd=None, sent=None)
+    self.assertEqual(local_connection._get_ws_close_code(exc), 1006)
+
+  def test_get_ws_close_code_fallback_to_code_attr(self):
+    """Verifies fallback to code attribute if rcvd/sent are not None but have no code attribute."""
+    exc = mock.MagicMock(spec=websockets.ConnectionClosed)
+    exc.rcvd = "invalid_rcvd_no_code"
+    exc.sent = "invalid_sent_no_code"
+    exc.code = 1008
+    self.assertEqual(local_connection._get_ws_close_code(exc), 1008)
+
 
 class LocalConnectionSendTest(unittest.IsolatedAsyncioTestCase):
   """Validates multi-modal coercion and InputEvent serialization inside LocalConnection.send()."""
@@ -3505,11 +5021,13 @@ class LocalConnectionSendTest(unittest.IsolatedAsyncioTestCase):
     await harness.conn.send("Standard text prompt")
 
     sent_data = await harness.wait_for_response()
-    self.assertEqual(sent_data.get("userInput"), "Standard text prompt")
-    self.assertNotIn("complexUserInput", sent_data)
+    self.assertIn("userInput", sent_data)
+    parts = sent_data["userInput"]["parts"]
+    self.assertEqual(len(parts), 1)
+    self.assertEqual(parts[0]["text"], "Standard text prompt")
 
   async def test_send_none_prompt_populates_blank_string(self):
-    """Verifies that passing a prompt of None maps to a blank userInput string frame."""
+    """Verifies that passing a prompt of None maps to a blank userInput text part."""
     harness = test_utils.TestLocalHarness(
         test_case=self,
         process=self.mock_process,
@@ -3518,12 +5036,13 @@ class LocalConnectionSendTest(unittest.IsolatedAsyncioTestCase):
 
     sent_data = await harness.wait_for_response()
 
-    # Assert it sets userInput to a blank string and does not use complex inputs
-    self.assertEqual(sent_data.get("userInput"), "")
-    self.assertNotIn("complexUserInput", sent_data)
+    self.assertIn("userInput", sent_data)
+    parts = sent_data["userInput"]["parts"]
+    self.assertEqual(len(parts), 1)
+    self.assertEqual(parts[0].get("text", ""), "")
 
-  async def test_send_single_media_content_populates_complex_user_input(self):
-    """Verifies that a single rich Content primitive maps to the complex_user_input parts list."""
+  async def test_send_single_media_content_populates_user_input(self):
+    """Verifies that a single rich Content primitive maps to the user_input parts list."""
     harness = test_utils.TestLocalHarness(
         test_case=self,
         process=self.mock_process,
@@ -3537,10 +5056,9 @@ class LocalConnectionSendTest(unittest.IsolatedAsyncioTestCase):
 
     sent_data = await harness.wait_for_response()
 
-    self.assertNotIn("userInput", sent_data)
-    self.assertIn("complexUserInput", sent_data)
+    self.assertIn("userInput", sent_data)
 
-    parts = sent_data["complexUserInput"]["parts"]
+    parts = sent_data["userInput"]["parts"]
     self.assertEqual(len(parts), 1)
     self.assertIn("media", parts[0])
     media = parts[0]["media"]
@@ -3563,10 +5081,9 @@ class LocalConnectionSendTest(unittest.IsolatedAsyncioTestCase):
 
     sent_data = await harness.wait_for_response()
 
-    self.assertNotIn("userInput", sent_data)
-    self.assertIn("complexUserInput", sent_data)
+    self.assertIn("userInput", sent_data)
 
-    parts = sent_data["complexUserInput"]["parts"]
+    parts = sent_data["userInput"]["parts"]
     self.assertEqual(len(parts), 2)
 
     self.assertEqual(parts[0]["text"], "Context text instruction.")
@@ -3574,8 +5091,8 @@ class LocalConnectionSendTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(parts[1]["media"]["mimeType"], "application/pdf")
     self.assertEqual(parts[1]["media"]["data"], "ZmFrZV9wZGY=")  # b"fake_pdf"
 
-  async def test_send_slash_command_populates_complex_user_input(self):
-    """Verifies that a SlashCommand primitive maps to complex_user_input slash_command field."""
+  async def test_send_slash_command_populates_user_input(self):
+    """Verifies that a SlashCommand primitive maps to user_input slash_command field."""
     harness = test_utils.TestLocalHarness(
         test_case=self,
         process=self.mock_process,
@@ -3587,10 +5104,9 @@ class LocalConnectionSendTest(unittest.IsolatedAsyncioTestCase):
 
     sent_data = await harness.wait_for_response()
 
-    self.assertNotIn("userInput", sent_data)
-    self.assertIn("complexUserInput", sent_data)
+    self.assertIn("userInput", sent_data)
 
-    parts = sent_data["complexUserInput"]["parts"]
+    parts = sent_data["userInput"]["parts"]
     self.assertEqual(len(parts), 1)
     self.assertIn("slashCommand", parts[0])
     sc = parts[0]["slashCommand"]
@@ -3654,7 +5170,9 @@ class LocalConnectionSendTest(unittest.IsolatedAsyncioTestCase):
     # Start a turn so the connection is non-idle.
     await harness.conn.send("initial prompt")
     initial_msg = await harness.wait_for_response()
-    self.assertEqual(initial_msg.get("userInput"), "initial prompt")
+    self.assertEqual(
+        initial_msg.get("userInput"), {"parts": [{"text": "initial prompt"}]}
+    )
 
     # send_trigger_notification should succeed even though we are mid-turn.
     await harness.conn.send_trigger_notification("trigger content")
@@ -3665,10 +5183,17 @@ class LocalConnectionSendTest(unittest.IsolatedAsyncioTestCase):
     # A regular send() should also succeed (no send-side guard).
     await harness.conn.send("follow-up prompt")
     followup_msg = await harness.wait_for_response()
-    self.assertEqual(followup_msg.get("userInput"), "follow-up prompt")
+    self.assertEqual(
+        followup_msg.get("userInput"),
+        {"parts": [{"text": "follow-up prompt"}]},
+    )
 
 
 class LocalAgentConfigTest(absltest.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    test_utils.patch_default_binary_path(self)
 
   def test_create_strategy(self):
     config = local_connection_config.LocalAgentConfig(
@@ -3715,7 +5240,7 @@ class LocalAgentConfigTest(absltest.TestCase):
   def test_merge_models_only_defaults(self):
     config = local_connection_config.LocalAgentConfig()
     self.assertLen(config.models, 2)
-    self.assertEqual(config.models[0].name, DEFAULT_MODEL)
+    self.assertEqual(config.models[0].name, models_lib.DEFAULT_MODEL)
     self.assertEqual(config.models[0].types, [types.ModelType.TEXT])
     self.assertEqual(
         config.models[1].name,
@@ -3742,7 +5267,7 @@ class LocalAgentConfigTest(absltest.TestCase):
     self.assertLen(config.models, 2)
     self.assertEqual(config.models[0].name, "custom-image-model")
     self.assertEqual(config.models[0].types, [types.ModelType.IMAGE])
-    self.assertEqual(config.models[1].name, DEFAULT_MODEL)
+    self.assertEqual(config.models[1].name, models_lib.DEFAULT_MODEL)
     self.assertEqual(config.models[1].types, [types.ModelType.TEXT])
 
   def test_merge_models_explicit_and_shorthand(self):
@@ -3804,6 +5329,143 @@ class LocalAgentConfigTest(absltest.TestCase):
     allow_policy = config.policies[1]
     self.assertEqual(allow_policy.tool, "*")
     self.assertEqual(allow_policy.decision, policy.Decision.APPROVE)
+
+  def test_lightweight_method(self):
+    config = local_connection_config.LocalAgentConfig(
+        model="gemini-3.8-flash",
+    ).lightweight()
+    self.assertIsInstance(config, local_connection_config.LocalAgentConfig)
+    self.assertEqual(config.model, "gemini-3.8-flash")
+    self.assertEqual(
+        config.capabilities.agent_behavior, types.AgentBehavior.MINIMAL
+    )
+    self.assertEqual(
+        config.capabilities.enabled_tools, types.BuiltinTools.minimal()
+    )
+    self.assertEqual(config.compaction_config.token_threshold, 65536)
+    self.assertIsNone(config.capabilities.compaction_threshold)
+    self.assertFalse(config.capabilities.enable_subagents)
+
+    # Verify HarnessConfig proto serialization with agent_behavior
+    strategy = config.create_strategy(tool_runner=None, hook_runner=None)
+    harness_config = strategy._build_harness_config()
+    self.assertEqual(
+        harness_config.agent_behavior,
+        localharness_pb2.AGENT_BEHAVIOR_MINIMAL,
+    )
+    self.assertEqual(harness_config.compaction_threshold, 65536)
+    self.assertEqual(
+        harness_config.compaction_config.token_threshold, 65536
+    )
+    self.assertFalse(harness_config.harness_side_tools.subagents.enabled)
+    self.assertTrue(harness_config.harness_side_tools.run_command.enabled)
+    self.assertTrue(harness_config.harness_side_tools.view_file.enabled)
+    self.assertTrue(harness_config.harness_side_tools.write_to_file.enabled)
+    self.assertTrue(harness_config.harness_side_tools.file_edit.enabled)
+    self.assertFalse(harness_config.harness_side_tools.list_dir.enabled)
+    self.assertFalse(harness_config.harness_side_tools.grep_search.enabled)
+    self.assertFalse(harness_config.harness_side_tools.find.enabled)
+    self.assertFalse(harness_config.harness_side_tools.user_questions.enabled)
+
+  def test_lightweight_method_with_overrides(self):
+    config = local_connection_config.LocalAgentConfig(
+        model="gemini-2.5-flash-lite",
+        capabilities=types.CapabilitiesConfig(
+            compaction_threshold=8000,
+        ),
+    ).lightweight()
+    self.assertIsInstance(config, local_connection_config.LocalAgentConfig)
+    self.assertEqual(config.model, "gemini-2.5-flash-lite")
+    self.assertEqual(config.capabilities.compaction_threshold, 8000)
+    self.assertIsNone(config.compaction_config)
+    self.assertFalse(config.capabilities.enable_subagents)
+    self.assertEqual(
+        config.capabilities.agent_behavior, types.AgentBehavior.MINIMAL
+    )
+    self.assertEqual(
+        config.capabilities.enabled_tools, types.BuiltinTools.minimal()
+    )
+
+  def test_lightweight_method_preserves_explicit_compaction_config(self):
+    custom_compaction = types.CompactionConfig(
+        token_threshold=12345,
+    )
+    config = local_connection_config.LocalAgentConfig(
+        model="gemini-3.8-flash",
+        compaction_config=custom_compaction,
+    ).lightweight()
+    self.assertEqual(config.compaction_config, custom_compaction)
+    strategy = config.create_strategy(tool_runner=None, hook_runner=None)
+    harness_config = strategy._build_harness_config()
+    self.assertEqual(harness_config.compaction_threshold, 12345)
+    self.assertEqual(
+        harness_config.compaction_config.token_threshold, 12345
+    )
+
+  def test_eval_method(self):
+    config = local_connection_config.LocalAgentConfig(
+        model="gemini-3.1-pro-preview",
+    ).eval()
+    self.assertIsInstance(config, local_connection_config.LocalAgentConfig)
+    self.assertEqual(config.model, "gemini-3.1-pro-preview")
+    self.assertFalse(config.capabilities.enable_subagents)
+    self.assertEqual(
+        config.capabilities.disabled_tools,
+        [types.BuiltinTools.GENERATE_IMAGE],
+    )
+    self.assertIsNone(config.capabilities.enabled_tools)
+    self.assertEqual(config.policies, [policy.allow_all()])
+    self.assertEqual(config.retry_config, types.RetryConfig.benchmark())
+
+    strategy = config.create_strategy(tool_runner=None, hook_runner=None)
+    harness_config = strategy._build_harness_config()
+    self.assertFalse(harness_config.harness_side_tools.subagents.enabled)
+    self.assertFalse(harness_config.harness_side_tools.generate_image.enabled)
+    self.assertFalse(harness_config.harness_side_tools.user_questions.enabled)
+    self.assertTrue(harness_config.harness_side_tools.run_command.enabled)
+    self.assertTrue(harness_config.harness_side_tools.view_file.enabled)
+    self.assertTrue(harness_config.harness_side_tools.write_to_file.enabled)
+    self.assertTrue(harness_config.harness_side_tools.file_edit.enabled)
+    self.assertFalse(harness_config.harness_side_tools.list_dir.enabled)
+    self.assertFalse(harness_config.harness_side_tools.grep_search.enabled)
+    self.assertFalse(harness_config.harness_side_tools.find.enabled)
+    self.assertEqual(
+        harness_config.retry_config.api_retry.max_retries, 0xFFFFFFFF
+    )
+    self.assertEqual(
+        harness_config.retry_config.api_retry.initial_sleep_duration_ms, 1000
+    )
+    self.assertFalse(harness_config.retry_config.HasField("model_output_retry"))
+    self.assertLen(harness_config.policy_config.rules, 1)
+    self.assertEqual(harness_config.policy_config.rules[0].tool, "*")
+    self.assertEqual(
+        harness_config.policy_config.rules[0].decision,
+        localharness_pb2.POLICY_DECISION_ALLOW,
+    )
+    self.assertEqual(
+        harness_config.policy_config.workspace_containment,
+        localharness_pb2.PolicyConfig.WORKSPACE_CONTAINMENT_DISABLED,
+    )
+
+  def test_eval_method_with_overrides(self):
+    custom_retry = types.RetryConfig(
+        api_retry=types.ModelAPIRetryConfig(max_retries=3)
+    )
+    config = local_connection_config.LocalAgentConfig(
+        model="gemini-3.1-pro-preview",
+        retry_config=custom_retry,
+        policies=policy.confirm_run_command(),
+        capabilities=types.CapabilitiesConfig(
+            disabled_tools=[types.BuiltinTools.SEARCH_WEB],
+        ),
+    ).eval()
+    self.assertEqual(config.retry_config, custom_retry)
+    self.assertLen(config.policies, 2)
+    self.assertFalse(config.capabilities.enable_subagents)
+    self.assertEqual(
+        config.capabilities.disabled_tools,
+        [types.BuiltinTools.SEARCH_WEB],
+    )
 
   def test_safe_defaults_with_default_workspace(self):
     """LocalAgentConfig defaults to CWD workspace when not specified."""
@@ -3884,6 +5546,54 @@ class LocalAgentConfigTest(absltest.TestCase):
           conversation_id="invalid_char_because_of_underscores_123",
       )
     self.assertIn("must match [a-zA-Z0-9-]", str(ctx.exception))
+
+  def test_local_agent_config_validates_allowed_subagents_success(self):
+    sub = types.SubagentConfig(
+        name="researcher",
+        description="researcher",
+        system_instructions="research",
+    )
+    config = local_connection_config.LocalAgentConfig(
+        subagents=[sub],
+        capabilities=types.CapabilitiesConfig(
+            allowed_subagents=["researcher"],
+        ),
+    )
+    self.assertEqual(config.capabilities.allowed_subagents, ["researcher"])
+
+  def test_local_agent_config_validates_allowed_subagents_unknown_raises(self):
+    sub = types.SubagentConfig(
+        name="researcher",
+        description="researcher",
+        system_instructions="research",
+    )
+    with self.assertRaisesRegex(
+        pydantic.ValidationError, "Unknown subagent name.*non_existent"
+    ):
+      local_connection_config.LocalAgentConfig(
+          subagents=[sub],
+          capabilities=types.CapabilitiesConfig(
+              allowed_subagents=["non_existent"],
+          ),
+      )
+
+  def test_local_agent_config_validates_subagent_allowed_subagents_unknown_raises(
+      self,
+  ):
+    sub = types.SubagentConfig(
+        name="researcher",
+        description="researcher",
+        capabilities=types.SubagentCapabilities(
+            enabled_tools=[types.BuiltinTools.START_SUBAGENT],
+            allowed_subagents=["ghost_agent"],
+        ),
+    )
+    with self.assertRaisesRegex(
+        pydantic.ValidationError, "Unknown subagent name.*ghost_agent"
+    ):
+      local_connection_config.LocalAgentConfig(
+          subagents=[sub],
+      )
 
   def test_create_strategy_with_mcp_servers(self):
     stdio_cfg = types.McpStdioServer(
@@ -4234,6 +5944,7 @@ class LocalConnectionSubagentsTest(unittest.IsolatedAsyncioTestCase):
 
   def setUp(self):
     super().setUp()
+    test_utils.patch_default_binary_path(self)
     self.temp_dir = self.enterContext(tempfile.TemporaryDirectory())
     self.workspace = pathlib.Path(self.temp_dir) / "workspace"
     self.workspace.mkdir()
@@ -4241,11 +5952,9 @@ class LocalConnectionSubagentsTest(unittest.IsolatedAsyncioTestCase):
   def test_builds_subagents_proto_correctly(self):
     def my_custom_tool():
       """A test tool."""
-      pass
 
     def another_one():
       """Another test tool."""
-      pass
 
     subagent = types.SubagentConfig(
         name="test_helper",
@@ -4371,33 +6080,122 @@ class LocalConnectionSubagentsTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(appended.appended_sections[0].title, "Section1")
     self.assertEqual(appended.appended_sections[0].content, "Content1")
 
-  def test_subagent_tool_not_registered_raises(self):
-    def unregistered_tool():
-      """Not added to parent."""
-      pass
+  def test_subagent_exclusive_tool_scoping(self):
+    def main_tool():
+      """Main agent tool."""
+
+    def sub_tool():
+      """Subagent exclusive tool."""
 
     subagent = types.SubagentConfig(
         name="test_helper",
         description="A helpful subagent",
-        tools=[unregistered_tool],
+        tools=[sub_tool],
+    )
+
+    tr = tool_runner.ToolRunner(tools=[main_tool, sub_tool])
+
+    strategy = local_connection.LocalConnectionStrategy(
+        subagents=[subagent],
+        workspaces=[str(self.workspace)],
+        tool_runner=tr,
+        tools=[main_tool],
+    )
+
+    harness_config = strategy._build_harness_config()
+
+    # Main agent tools should only have main_tool.
+    self.assertEqual([t.name for t in harness_config.tools], ["main_tool"])
+    # Subagent tools should only have sub_tool.
+    self.assertEqual(len(harness_config.custom_subagents), 1)
+    self.assertEqual(
+        [t.name for t in harness_config.custom_subagents[0].tools],
+        ["sub_tool"],
+    )
+
+  def test_subagent_exclusive_callable_tool_resolved_automatically(self):
+    def sub_only_tool():
+      """Only on subagent without tool_runner."""
+
+    subagent = types.SubagentConfig(
+        name="test_helper",
+        description="A helpful subagent",
+        tools=[sub_only_tool],
     )
 
     strategy = local_connection.LocalConnectionStrategy(
         subagents=[subagent],
         workspaces=[str(self.workspace)],
+        tools=[],
     )
 
-    with self.assertRaisesRegex(
-        ValueError,
-        "Subagent tool 'unregistered_tool' is not registered on the main agent"
-        " config",
-    ):
-      strategy._build_harness_config()
+    harness_config = strategy._build_harness_config()
 
-  def test_subagent_harness_tools_as_strings_raise_if_not_registered(self):
+    self.assertEqual(len(harness_config.tools), 0)
+    self.assertEqual(len(harness_config.custom_subagents), 1)
+    self.assertEqual(
+        [t.name for t in harness_config.custom_subagents[0].tools],
+        ["sub_only_tool"],
+    )
+
+  def test_subagent_callable_functor_without_name(self):
+    class FunctorTool:
+
+      def __call__(self, x: int) -> int:
+        """A functor tool."""
+        return x * 2
+
+    functor = FunctorTool()
     subagent = types.SubagentConfig(
-        name="test_helper",
-        description="A helpful subagent",
+        name="functor_helper",
+        description="Helper with functor",
+        tools=[functor],
+    )
+
+    strategy = local_connection.LocalConnectionStrategy(
+        subagents=[subagent],
+        workspaces=[str(self.workspace)],
+        tools=[],
+    )
+
+    harness_config = strategy._build_harness_config()
+    self.assertEqual(len(harness_config.custom_subagents), 1)
+    self.assertEqual(
+        [t.name for t in harness_config.custom_subagents[0].tools],
+        ["FunctorTool"],
+    )
+
+  def test_build_harness_config_tools_none_fallback(self):
+    def root_tool():
+      """Root tool."""
+
+    def sub_tool():
+      """Sub tool."""
+
+    subagent = types.SubagentConfig(
+        name="sub",
+        description="sub",
+        tools=[sub_tool],
+    )
+    tr = tool_runner.ToolRunner(tools=[root_tool, sub_tool])
+    strategy = local_connection.LocalConnectionStrategy(
+        subagents=[subagent],
+        workspaces=[str(self.workspace)],
+        tool_runner=tr,
+        # tools not specified (None)
+    )
+
+    harness_config = strategy._build_harness_config()
+    self.assertEqual([t.name for t in harness_config.tools], ["root_tool"])
+    self.assertEqual(
+        [t.name for t in harness_config.custom_subagents[0].tools],
+        ["sub_tool"],
+    )
+
+  def test_subagent_string_named_tools_builds_tool_protos(self):
+    subagent = types.SubagentConfig(
+        name="string_tool_helper",
+        description="Helper with string tools",
         tools=["view_file", "code_search"],
     )
 
@@ -4406,16 +6204,36 @@ class LocalConnectionSubagentsTest(unittest.IsolatedAsyncioTestCase):
         workspaces=[str(self.workspace)],
     )
 
+    harness_config = strategy._build_harness_config()
+    self.assertEqual(len(harness_config.custom_subagents), 1)
+    self.assertEqual(
+        [t.name for t in harness_config.custom_subagents[0].tools],
+        ["view_file", "code_search"],
+    )
+
+  def test_subagent_invalid_tool_type_raises_value_error(self):
+    subagent = types.SubagentConfig.model_construct(
+        name="invalid_helper",
+        description="Helper with invalid tool",
+        tools=[12345],  # pytype: disable=wrong-arg-types
+    )
+
+    strategy = local_connection.LocalConnectionStrategy(
+        subagents=[subagent],
+        workspaces=[str(self.workspace)],
+    )
+
     with self.assertRaisesRegex(
         ValueError,
-        "Subagent tool 'view_file' is not registered on the main agent config",
+        "Invalid tool type in subagent 'invalid_helper' tools list: 12345",
     ):
       strategy._build_harness_config()
 
-  def test_subagent_tools_stripped_and_warned(self):
+  def test_subagent_with_start_subagent_enables_nested_delegation(self):
+    """Verifies subagents with START_SUBAGENT get subagents.enabled=True."""
     subagent = types.SubagentConfig(
         name="nested_helper",
-        description="A subagent trying to use subagents",
+        description="A subagent that can spawn subagents",
         system_instructions="Spawn subagents.",
         capabilities=types.SubagentCapabilities(
             enabled_tools=[types.BuiltinTools.START_SUBAGENT],
@@ -4427,20 +6245,11 @@ class LocalConnectionSubagentsTest(unittest.IsolatedAsyncioTestCase):
         workspaces=[str(self.workspace)],
     )
 
-    with self.assertLogs(level="WARNING") as log_capture:
-      harness_config = strategy._build_harness_config()
-
-    # Verify warning was logged
-    self.assertTrue(
-        any(
-            "Nested subagents are currently not supported" in msg
-            for msg in log_capture.output
-        )
-    )
+    harness_config = strategy._build_harness_config()
 
     self.assertEqual(len(harness_config.custom_subagents), 1)
     custom_agent = harness_config.custom_subagents[0]
-    self.assertFalse(custom_agent.harness_side_tools.subagents.enabled)
+    self.assertTrue(custom_agent.harness_side_tools.subagents.enabled)
     self.assertFalse(custom_agent.harness_side_tools.file_edit.enabled)
 
   def test_local_agent_config_subagents_none_initializes(self):
@@ -4454,6 +6263,561 @@ class LocalConnectionSubagentsTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(config.subagents, [])
     self.assertIsInstance(config.capabilities, types.CapabilitiesConfig)
     self.assertIsNone(config.conversation_id)
+
+
+class _EvalProxyServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+  daemon_threads = True
+
+  def __init__(self, server_address, handler_class, workspace_dir: str):
+    super().__init__(server_address, handler_class)
+    self.workspace_dir = workspace_dir
+    self.captured_requests: list[dict[str, Any]] = []
+    self.attempt_counter = 0
+    self.lock = threading.Lock()
+
+
+class _EvalProxyHandler(http.server.BaseHTTPRequestHandler):
+
+  def log_message(self, format_str, *args):
+    pass
+
+  def do_POST(self):  # pylint: disable=invalid-name
+    length = int(self.headers.get("Content-Length", 0))
+    raw_body = self.rfile.read(length)
+    req_json = json.loads(raw_body.decode("utf-8"))
+
+    with self.server.lock:
+      self.server.attempt_counter += 1
+      attempt = self.server.attempt_counter
+      self.server.captured_requests.append({
+          "path": self.path,
+          "attempt": attempt,
+          "json": req_json,
+      })
+
+    # Attempt 1: Return transient HTTP 503 to verify RetryConfig.benchmark()
+    if attempt == 1:
+      err_payload = json.dumps({
+          "error": {
+              "code": 503,
+              "message": "Simulated transient 503 for eval retry test",
+              "status": "UNAVAILABLE",
+          }
+      }).encode("utf-8")
+      self.send_response(503)
+      self.send_header("Content-Type", "application/json")
+      self.send_header("Content-Length", str(len(err_payload)))
+      self.end_headers()
+      self.wfile.write(err_payload)
+      return
+
+    # Check if contents already includes a functionResponse from run_command
+    has_fn_response = False
+    for content in req_json.get("contents", []):
+      for part in content.get("parts", []):
+        if "functionResponse" in part:
+          has_fn_response = True
+
+    if not has_fn_response:
+      # Attempt 2: Return a functionCall to run_command to verify allow_all()
+      candidate_part = {
+          "functionCall": {
+              "name": "run_command",
+              "args": {
+                  "CommandLine": "echo E2E_EVAL_TEST_OK",
+                  "Cwd": self.server.workspace_dir,
+                  "WaitMsBeforeAsync": 5000,
+                  "toolAction": "Running echo",
+                  "toolSummary": "Run echo",
+              },
+          }
+      }
+    else:
+      # Attempt 3: Return final model text after run_command succeeded
+      candidate_part = {"text": "Verified output: E2E_EVAL_TEST_OK"}
+
+    resp_obj = {
+        "candidates": [{
+            "content": {"role": "model", "parts": [candidate_part]},
+            "finishReason": "STOP",
+        }]
+    }
+    if "alt=sse" in self.path:
+      body = f"data: {json.dumps(resp_obj)}\r\n\r\n".encode("utf-8")
+      content_type = "text/event-stream"
+    else:
+      body = json.dumps(resp_obj).encode("utf-8")
+      content_type = "application/json"
+
+    self.send_response(200)
+    self.send_header("Content-Type", content_type)
+    self.send_header("Content-Length", str(len(body)))
+    self.end_headers()
+    self.wfile.write(body)
+
+
+class LocalAgentConfigEvalE2ETest(unittest.IsolatedAsyncioTestCase):
+  """End-to-end verification of LocalAgentConfig.eval() with localharness."""
+
+  async def test_eval_e2e_http_payload_policy_and_retry(self):
+    try:
+      local_connection._get_default_binary_path(None)
+    except RuntimeError:
+      self.skipTest("localharness binary not available in this environment")
+
+    with tempfile.TemporaryDirectory() as workspace_dir:
+      server = _EvalProxyServer(
+          ("127.0.0.1", 0), _EvalProxyHandler, workspace_dir
+      )
+      self.addCleanup(server.shutdown)
+      self.addCleanup(server.server_close)
+      thread = threading.Thread(target=server.serve_forever, daemon=True)
+      thread.start()
+      proxy_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+      config = local_connection_config.LocalAgentConfig(
+          workspaces=[workspace_dir],
+          api_key="test-eval-api-key",
+          model=types.ModelTarget(
+              name="gemini-3-flash-preview",
+              endpoint=types.GeminiAPIEndpoint(
+                  base_url=proxy_url,
+                  api_key="test-eval-api-key",
+              ),
+          ),
+      ).eval()
+
+      strategy = config.create_strategy(tool_runner=None, hook_runner=None)
+      async with strategy:
+        conn = strategy.connect()
+        await conn.send("Run echo E2E_EVAL_TEST_OK")
+        steps = [step async for step in conn.receive_steps()]
+
+      # 1. Verify RetryConfig.benchmark() retried the initial 503 error
+      self.assertEqual(server.attempt_counter, 3)
+
+      # 2. Verify HTTP payload tool declarations omit generate_image,
+      # ask_question, and subagent tools while preserving coding tools
+      # and enabling IsDaemon on run_command.
+      first_req_json = server.captured_requests[0]["json"]
+      declared_tools = []
+      run_command_decl = None
+      for tool_group in first_req_json.get("tools", []):
+        for decl in tool_group.get("functionDeclarations", []):
+          declared_tools.append(decl["name"])
+          if decl["name"] == "run_command":
+            run_command_decl = decl
+      self.assertNotIn("generate_image", declared_tools)
+      self.assertNotIn("ask_question", declared_tools)
+      self.assertNotIn("invoke_subagent", declared_tools)
+      self.assertNotIn("define_subagent", declared_tools)
+      self.assertNotIn("manage_subagents", declared_tools)
+      self.assertNotIn("send_message", declared_tools)
+      self.assertIn("run_command", declared_tools)
+      self.assertIsNotNone(run_command_decl)
+      harness_config = strategy._build_harness_config()
+      self.assertTrue(
+          harness_config.harness_side_tools.run_command.enable_daemon_commands
+      )
+      self.assertEqual(
+          harness_config.policy_config.workspace_containment,
+          localharness_pb2.PolicyConfig.WORKSPACE_CONTAINMENT_DISABLED,
+      )
+      self.assertEqual(
+          harness_config.workspaces[0].filesystem_workspace.directory,
+          workspace_dir,
+      )
+      self.assertIn("IsDaemon", json.dumps(run_command_decl))
+      self.assertIn("view_file", declared_tools)
+      self.assertIn("write_to_file", declared_tools)
+      self.assertIn("replace_file_content", declared_tools)
+
+      # 3. Verify System Instructions omit <subagents>, <subagent_reminder>,
+      # and <knowledge_items>.
+      si_parts = first_req_json.get("systemInstruction", {}).get("parts", [])
+      si_text = "\n".join(p.get("text", "") for p in si_parts)
+      self.assertNotIn("<subagents>", si_text)
+      self.assertNotIn("<subagent_reminder>", si_text)
+      self.assertNotIn("<knowledge_items>", si_text)
+
+      # 3b. Verify generationConfig.thinkingConfig defaults to
+      # thinkingLevel=high on the HTTP wire when LocalAgentConfig(...).eval()
+      # is used.
+      self.assertEqual(
+          first_req_json.get("generationConfig", {}).get("thinkingConfig"),
+          {"includeThoughts": True, "thinkingLevel": "high"},
+      )
+
+      # 4. Verify [policy.allow_all()] executed run_command autonomously and
+      # returned the stdout in the subsequent HTTP request's functionResponse.
+      third_req_json = server.captured_requests[2]["json"]
+      fn_responses = []
+      for content in third_req_json.get("contents", []):
+        for part in content.get("parts", []):
+          if "functionResponse" in part:
+            fn_responses.append(part["functionResponse"])
+      self.assertTrue(fn_responses)
+      self.assertIn("E2E_EVAL_TEST_OK", json.dumps(fn_responses))
+      self.assertTrue(
+          any("E2E_EVAL_TEST_OK" in (s.content or "") for s in steps)
+      )
+
+  def test_eval_defaults_text_model_thinking_level_high_without_mutating_original(
+      self,
+  ):
+    original = local_connection_config.LocalAgentConfig(api_key="test-key")
+    eval_cfg = original.eval()
+
+    # Original config is unmutated
+    self.assertIsNone(original.models[0].endpoint.options)
+    self.assertIsNone(original.models[1].endpoint.options)
+
+    # Eval config sets thinking_level=HIGH on TEXT model, leaves IMAGE unset
+    self.assertIsNotNone(eval_cfg.models[0].endpoint.options)
+    self.assertEqual(
+        eval_cfg.models[0].endpoint.options.thinking_level,
+        types.ThinkingLevel.HIGH,
+    )
+    self.assertIsNone(eval_cfg.models[1].endpoint.options)
+
+    strategy = eval_cfg.create_strategy(tool_runner=None, hook_runner=None)
+    harness_config = strategy._build_harness_config()
+    self.assertEqual(
+        harness_config.models[0].gemini_api_endpoint.options.thinking_level,
+        "high",
+    )
+    self.assertFalse(
+        harness_config.models[1].gemini_api_endpoint.HasField("options")
+    )
+
+  def test_eval_shorthand_model_retains_thinking_level_after_field_assignment(
+      self,
+  ):
+    cfg = local_connection_config.LocalAgentConfig(
+        model="custom-eval-model", api_key="k"
+    ).eval()
+    cfg.save_dir = "/tmp/x"
+
+    self.assertEqual(cfg.model, "custom-eval-model")
+    self.assertEqual(cfg.models[0].name, "custom-eval-model")
+    self.assertEqual(cfg.models[0].endpoint.api_key, "k")
+    self.assertEqual(
+        cfg.models[0].endpoint.options.thinking_level,
+        types.ThinkingLevel.HIGH,
+    )
+    self.assertIsNone(cfg.models[1].endpoint.options)
+
+  def test_eval_all_thinking_level_enum_values_and_none(self):
+    for level in (
+        types.ThinkingLevel.MINIMAL,
+        types.ThinkingLevel.LOW,
+        types.ThinkingLevel.MEDIUM,
+        types.ThinkingLevel.HIGH,
+    ):
+      cfg = local_connection_config.LocalAgentConfig().eval(
+          thinking_level=level
+      )
+      self.assertEqual(
+          cfg.models[0].endpoint.options.thinking_level,
+          level,
+      )
+      self.assertIsNone(cfg.models[1].endpoint.options)
+      strategy = cfg.create_strategy(tool_runner=None, hook_runner=None)
+      harness_config = strategy._build_harness_config()
+      self.assertEqual(
+          harness_config.models[0].gemini_api_endpoint.options.thinking_level,
+          level.value,
+      )
+      self.assertFalse(
+          harness_config.models[1].gemini_api_endpoint.HasField("options")
+      )
+
+    none_cfg = local_connection_config.LocalAgentConfig().eval(
+        thinking_level=None
+    )
+    self.assertIsNone(none_cfg.models[0].endpoint.options)
+    self.assertIsNone(none_cfg.models[1].endpoint.options)
+
+  def test_eval_vertex_endpoint_sets_thinking_level_high_and_preserves_fields(
+      self,
+  ):
+    cfg = local_connection_config.LocalAgentConfig(
+        vertex=True, project="p", location="us-central1", api_key="v-key"
+    ).eval()
+
+    self.assertIsInstance(cfg.models[0].endpoint, types.VertexEndpoint)
+    self.assertEqual(cfg.models[0].endpoint.project, "p")
+    self.assertEqual(cfg.models[0].endpoint.location, "us-central1")
+    self.assertEqual(cfg.models[0].endpoint.api_key, "v-key")
+    self.assertEqual(
+        cfg.models[0].endpoint.options.thinking_level,
+        types.ThinkingLevel.HIGH,
+    )
+    self.assertIsNone(cfg.models[1].endpoint.options)
+
+    strategy = cfg.create_strategy(tool_runner=None, hook_runner=None)
+    harness_config = strategy._build_harness_config()
+    self.assertEqual(
+        harness_config.models[0].vertex_endpoint.options.thinking_level, "high"
+    )
+    self.assertEqual(harness_config.models[0].vertex_endpoint.project, "p")
+    self.assertEqual(
+        harness_config.models[0].vertex_endpoint.location, "us-central1"
+    )
+
+  def test_eval_preserves_existing_endpoint_options_when_thinking_level_unset(
+      self,
+  ):
+    image_target = types.ModelTarget(
+        name="custom-image",
+        types=[types.ModelType.IMAGE],
+        endpoint=types.GeminiAPIEndpoint(api_key="img-key"),
+    )
+    original_target = types.ModelTarget(
+        name="m",
+        endpoint=types.GeminiAPIEndpoint(
+            base_url="http://localhost:8080",
+            options=types.GeminiModelOptions(
+                service_tier=types.ServiceTier.PRIORITY,
+            ),
+        ),
+    )
+    cfg = local_connection_config.LocalAgentConfig(
+        models=[image_target],
+        model=original_target,
+    ).eval(thinking_level=types.ThinkingLevel.MEDIUM)
+
+    # Original ModelTarget is unmutated
+    self.assertIsNone(original_target.endpoint.options.thinking_level)
+
+    # cfg.models[0] is image_target; cfg.models[1] and cfg.model are updated m
+    self.assertEqual(cfg.models[0].name, "custom-image")
+    self.assertIsNone(cfg.models[0].endpoint.options)
+    self.assertEqual(cfg.models[1].name, "m")
+    self.assertEqual(cfg.models[1].endpoint.base_url, "http://localhost:8080")
+    self.assertEqual(
+        cfg.models[1].endpoint.options.thinking_level,
+        types.ThinkingLevel.MEDIUM,
+    )
+    self.assertEqual(
+        cfg.models[1].endpoint.options.service_tier,
+        types.ServiceTier.PRIORITY,
+    )
+    self.assertIsInstance(cfg.model, types.ModelTarget)
+    self.assertEqual(cfg.model.name, "m")
+    self.assertEqual(
+        cfg.model.endpoint.options.thinking_level,
+        types.ThinkingLevel.MEDIUM,
+    )
+
+  def test_eval_multiple_text_models_and_multimodal_target(self):
+    cfg = local_connection_config.LocalAgentConfig(
+        models=[
+            types.ModelTarget(
+                name="primary-text",
+                types=[types.ModelType.TEXT],
+                endpoint=types.GeminiAPIEndpoint(api_key="k1"),
+            ),
+            types.ModelTarget(
+                name="fallback-text",
+                types=[types.ModelType.TEXT],
+                endpoint=types.VertexEndpoint(project="p", location="global"),
+            ),
+            types.ModelTarget(
+                name="multimodal",
+                types=[types.ModelType.TEXT, types.ModelType.IMAGE],
+                endpoint=types.GeminiAPIEndpoint(api_key="k2"),
+            ),
+            types.ModelTarget(
+                name="image-only",
+                types=[types.ModelType.IMAGE],
+                endpoint=types.GeminiAPIEndpoint(api_key="k3"),
+            ),
+        ]
+    ).eval(thinking_level=types.ThinkingLevel.LOW)
+
+    self.assertEqual(
+        cfg.models[0].endpoint.options.thinking_level,
+        types.ThinkingLevel.LOW,
+    )
+    self.assertEqual(
+        cfg.models[1].endpoint.options.thinking_level,
+        types.ThinkingLevel.LOW,
+    )
+    self.assertEqual(
+        cfg.models[2].endpoint.options.thinking_level,
+        types.ThinkingLevel.LOW,
+    )
+    self.assertIsNone(cfg.models[3].endpoint.options)
+
+  def test_eval_raises_when_model_target_already_sets_thinking_level(self):
+    base_cfg = local_connection_config.LocalAgentConfig(
+        model=types.ModelTarget(
+            name="m",
+            endpoint=types.GeminiAPIEndpoint(
+                options=types.GeminiModelOptions(
+                    thinking_level=types.ThinkingLevel.LOW,
+                ),
+            ),
+        )
+    )
+    with self.assertRaisesRegex(
+        ValueError, "already sets thinking_level=.*pass it to .eval"
+    ):
+      base_cfg.eval()
+
+    with self.assertRaisesRegex(
+        ValueError, "already sets thinking_level=.*pass it to .eval"
+    ):
+      base_cfg.eval(thinking_level=types.ThinkingLevel.MEDIUM)
+
+    # Double .eval() also raises because the first .eval() sets thinking_level
+    eval_once = local_connection_config.LocalAgentConfig().eval()
+    with self.assertRaisesRegex(
+        ValueError, "already sets thinking_level=.*pass it to .eval"
+    ):
+      eval_once.eval()
+
+    # Calling .eval(thinking_level=None) succeeds and preserves LOW
+    preserved = base_cfg.eval(thinking_level=None)
+    self.assertEqual(
+        preserved.models[0].endpoint.options.thinking_level,
+        types.ThinkingLevel.LOW,
+    )
+
+  def test_eval_raises_when_explicit_model_target_has_none_endpoint(self):
+    original = local_connection_config.LocalAgentConfig(
+        api_key="explicit-key",
+        models=[types.ModelTarget(name="custom", endpoint=None)],
+    )
+    with self.assertRaisesRegex(
+        ValueError,
+        "endpoint must be a GeminiAPIEndpoint or VertexEndpoint, got NoneType",
+    ):
+      original.eval()
+
+  def test_eval_raises_on_litert_and_local_openai_configs_unless_thinking_level_none(
+      self,
+  ):
+    litert_cfg = litert_connection_config.LiteRTAgentConfig(
+        model_path="/path/to/gemma.litertlm"
+    )
+    with self.assertRaisesRegex(
+        ValueError,
+        "Cannot apply thinking_level in eval\\(\\) on LiteRTAgentConfig",
+    ):
+      litert_cfg.eval()
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "Cannot apply thinking_level in eval\\(\\) on LiteRTAgentConfig",
+    ):
+      litert_cfg.eval(thinking_level=types.ThinkingLevel.LOW)
+
+    litert_eval_none = litert_cfg.eval(thinking_level=None)
+    self.assertIsInstance(
+        litert_eval_none, litert_connection_config.LiteRTAgentConfig
+    )
+    self.assertFalse(litert_eval_none.capabilities.enable_subagents)
+
+    openai_cfg = local_openai_connection_config.LocalOpenAIAgentConfig(
+        model="qwen2.5-coder",
+        base_url="http://localhost:11434/v1",
+    )
+    with self.assertRaisesRegex(
+        ValueError,
+        "Cannot apply thinking_level in eval\\(\\) on LocalOpenAIAgentConfig",
+    ):
+      openai_cfg.eval()
+
+    with self.assertRaisesRegex(
+        ValueError,
+        "Cannot apply thinking_level in eval\\(\\) on LocalOpenAIAgentConfig",
+    ):
+      openai_cfg.eval(thinking_level=types.ThinkingLevel.MEDIUM)
+
+    openai_eval_none = openai_cfg.eval(thinking_level=None)
+    self.assertIsInstance(
+        openai_eval_none, local_openai_connection_config.LocalOpenAIAgentConfig
+    )
+    self.assertFalse(openai_eval_none.capabilities.enable_subagents)
+
+  def test_all_local_configs_forward_shared_strategy_fields(self):
+    """Verifies that all BaseLocalAgentConfig subclasses forward shared strategy fields."""
+    def sample_tool(x: str) -> str:
+      """Sample tool."""
+      return x
+
+    custom_policies = [policy.deny("run_command"), policy.deny("create_file")]
+    budget = types.BudgetConfig()
+
+    class _FakeLiteRTStrategy(local_connection.LocalConnectionStrategy):
+
+      def __init__(self, *, model_path: str, **kwargs):
+        self.model_path = model_path
+        for k in (
+            "backend",
+            "enable_speculative_decoding",
+            "cache_dir",
+            "audio_backend",
+            "vision_backend",
+            "port",
+            "download_if_missing",
+        ):
+          kwargs.pop(k, None)
+        super().__init__(**kwargs)
+
+    fake_litert_mod = mock.MagicMock()
+    fake_litert_mod.LiteRTConnectionStrategy = _FakeLiteRTStrategy
+
+    with mock.patch.dict(
+        "sys.modules",
+        {
+            "google.antigravity.connections.local.litert_connection": (
+                fake_litert_mod
+            )
+        },
+    ):
+      configs = [
+          local_connection_config.LocalAgentConfig(
+              model="gemini-2.5-flash",
+              policies=custom_policies,
+              tools=[sample_tool],
+              budget_config=budget,
+              conversation_id="c" * 32,
+              session_continuation_mode=types.SessionContinuationMode.RESUME,
+          ),
+          local_openai_connection_config.LocalOpenAIAgentConfig(
+              base_url="http://localhost:11434/v1",
+              model="llama3.1",
+              policies=custom_policies,
+              tools=[sample_tool],
+              budget_config=budget,
+              conversation_id="c" * 32,
+              session_continuation_mode=types.SessionContinuationMode.RESUME,
+          ),
+          litert_connection_config.LiteRTAgentConfig(
+              model_path="/tmp/model.litertlm",
+              policies=custom_policies,
+              tools=[sample_tool],
+              budget_config=budget,
+              conversation_id="c" * 32,
+              session_continuation_mode=types.SessionContinuationMode.RESUME,
+          ),
+      ]
+      for cfg in configs:
+        with self.subTest(config_cls=type(cfg).__name__):
+          strategy = cfg.create_strategy(
+              tool_runner=mock.MagicMock(),
+              hook_runner=mock.MagicMock(),
+          )
+          self.assertEqual(strategy._policies, custom_policies)
+          self.assertEqual(strategy._tools, [sample_tool])
+          self.assertEqual(strategy._budget_config, budget)
+          self.assertEqual(
+              strategy._session_continuation_mode,
+              types.SessionContinuationMode.RESUME,
+          )
 
 
 if __name__ == "__main__":

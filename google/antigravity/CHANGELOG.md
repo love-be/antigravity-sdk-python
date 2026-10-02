@@ -1,11 +1,326 @@
 # Changelog
 
-<!-- disableFinding(LINE_OVER_80) -->
-<!-- disableFinding(LIST_NO_LINE) -->
+
+
 
 All notable changes to the Google Antigravity Python SDK will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+
+## [0.1.18] - 2026-09-21
+
+This release announces official Antigravity SDK local model support (LiteRT and LocalOpenAI configs are now ready to use), adds a standardized evaluation configuration preset to provide a product-agnostic default for Gemini's coding ability, introduces custom model overrides for subagents, enables schedule and background task management by default, and expands compatibility with Vertex AI service tier handling.
+
+### 🌟 Key Highlights
+- **Antigravity SDK + Local Models Support**: Official local model support is now ready to use with first-class `LiteRTAgentConfig` and `LocalOpenAIAgentConfig` configurations. Developers can execute on-device models with automated lightweight presets or integrate with local OpenAI-compatible endpoints.
+  ```python
+  from google.antigravity import LiteRTAgentConfig, LocalOpenAIAgentConfig
+
+  # On-device execution with LiteRT
+  litert_config = LiteRTAgentConfig(model_path="/path/to/gemma-4-26b.bin")
+
+  # Local OpenAI-compatible server
+  local_config = LocalOpenAIAgentConfig(base_url="http://localhost:8000/v1")
+  ```
+
+- **Standardized Evaluation Preset (`AgentConfig.eval()`)**: Adds a standardized, benchmark-ready preset that configures autonomous permissions, benchmark retry behavior, daemon execution in commands, and strips image generation and subagents to focus on core coding evaluations.
+  ```python
+  from google.antigravity import LocalAgentConfig
+
+  config = LocalAgentConfig().eval()
+  ```
+
+- **Custom Subagent Models**: Allows developers to assign specific model targets to subagents independently of the root agent configuration.
+  ```python
+  from google.antigravity import SubagentConfig
+
+  researcher = SubagentConfig(name="researcher", model="gemini-2.5-pro")
+  ```
+
+- **Built-in Schedule Tool**: Enables the `schedule` tool by default across standard tool groups, permitting agents and subagents to set timers and cron-based background jobs alongside task management.
+  ```python
+  from google.antigravity import BuiltinTools, LocalAgentConfig
+
+  # BuiltinTools.SCHEDULE is enabled by default; exclude if not desired
+  config = LocalAgentConfig(disabled_tools=[BuiltinTools.SCHEDULE])
+  ```
+
+- **Automatic Lightweight Presets for LiteRT**: Instantiating `LiteRTAgentConfig` now automatically applies optimized lightweight presets—including reduced prompt overhead and synchronous context compaction—without requiring an explicit call to `.lightweight()`.
+  ```python
+  from google.antigravity import LiteRTAgentConfig
+
+  # Automatically configures lightweight presets for local execution
+  config = LiteRTAgentConfig(model_path="/path/to/gemma-4-26b.bin")
+  ```
+
+---
+
+### 📋 Detailed Changes
+
+#### Features & Enhancements
+- **Task Management Pairing**: Automatically enables the `manage_task` tool whenever `run_command` or `schedule` is active, allowing background task lifecycle management.
+- **LiteRT & Local Model Examples**: Added getting-started guides and end-to-end examples demonstrating on-device execution with `LiteRTAgentConfig` (Gemma 4 26B) and OpenAI-compatible local endpoints via `LocalOpenAIAgentConfig`.
+- **Sandbox Availability Warning**: Added a session startup warning when `enable_sandbox=True` is requested on an environment or OS backend where sandbox isolation cannot be enforced.
+- **Extended JSON Schema Normalization**: Added schema normalization support for OpenAPI and JSON Schema Draft 7 / 2020-12 keywords (such as `multipleOf`, `prefixItems`, and `dependentSchemas`) and prevented accidental mutation of uppercase sample values.
+- **Optimized ToolRunner Coercion**: Improved type resolution for closure-scoped tools and forward-referenced `ToolContext` parameters, and introduced TypeAdapter caching to accelerate tool call execution.
+- **Top-Level `ServiceTier` Export**: Re-exported `ServiceTier` at the root package namespace for easier import parity.
+
+#### Model & Default Changes
+- **Excluded `ASK_QUESTION` from Default Tools**: Excluded `BuiltinTools.ASK_QUESTION` from `BuiltinTools.default()`. Default configurations run autonomously; agents in headless workflows will no longer attempt interactive user prompts. To re-enable interactive questions, explicitly pass `BuiltinTools.ASK_QUESTION` in `enabled_tools`.
+- **Single Compaction Threshold Dial**: Simplified `CompactionConfig` to a single `token_threshold` property, deprecating legacy context token limits and interval dials. To configure context compaction, specify `CompactionConfig(token_threshold=...)`.
+- **Removed Deprecated `modified_arguments_json`**: Removed the legacy JSON string fallback in tool hook interception in favor of `modified_args`.
+
+#### Bug Fixes
+- **Service Tier Ingestion**: Fixed an unhandled `ValueError` when connecting via gateways reporting unlisted backend service tiers (such as Vertex AI `PROVISIONED_THROUGHPUT`) by safely ignoring unknown tier values while preserving token counts.
+
+## [0.1.17] - 2026-09-14
+
+This release introduces first-class conversation compaction controls via `CompactionConfig`, delta and forward-looking budget scopes for session resumption, tool output token truncation limits, and expanded arithmetic operations on `UsageMetadata`. It also delivers OS-level terminal sandboxing examples and automated tool wrapper reflection preservation.
+
+### 🌟 Key Highlights
+- **Compaction Configuration**: Adds `CompactionConfig` on `AgentConfig` to govern sliding-window conversation history compaction through an explicit token ceiling dial (`token_threshold`), deprecating `CapabilitiesConfig.compaction_threshold`.
+  ```python
+  from google.antigravity import CompactionConfig, LocalAgentConfig
+
+  config = LocalAgentConfig(compaction_config=CompactionConfig(token_threshold=50000))
+  ```
+- **Forward-Looking Budget Scope**: Adds `BudgetScope.FORWARD_LOOKING` to `BudgetConfig` to enforce model call and token budgets across newly resumed execution turns without counting previous historical usage.
+  ```python
+  from google.antigravity import BudgetConfig, BudgetScope, LocalAgentConfig
+
+  config = LocalAgentConfig(budget_config=BudgetConfig(max_total_tokens=10000, scope=BudgetScope.FORWARD_LOOKING))
+  ```
+- **Tool Output Token Truncation**: Exposes `tool_output_truncation_config` across agent configurations to cap token output volume initially for `run_command` executions in localharness.
+  ```python
+  from google.antigravity import CapabilitiesConfig, LocalAgentConfig, ToolOutputTruncationConfig
+
+  config = LocalAgentConfig(
+      capabilities=CapabilitiesConfig(
+          tool_output_truncation_config=ToolOutputTruncationConfig(max_tokens=2048)
+      )
+  )
+  ```
+- **UsageMetadata Arithmetic**: Supports standard Python arithmetic protocols on `UsageMetadata`, enabling scalar multiplications, scaling, and accumulating token counts using built-in `sum()`.
+  ```python
+  from google.antigravity.types import UsageMetadata
+
+  total_usage = sum([usage1, usage2], start=UsageMetadata())
+  scaled_usage = total_usage * 1.5
+  ```
+
+---
+
+### 📋 Detailed Changes
+
+#### Features & Enhancements
+- **Tool Wrapper Metadata Preservation**: Preserves function signature, module name, annotations, and original callable references via `__wrapped__` when registering tools with `ToolWithSchema`.
+- **Interactive REPL Policy Flattening**: Automatically flattens nested policy lists during interactive REPL upgrades so nested command authorization rules correctly upgrade to prompt the user.
+- **Terminal Command Sandboxing Guide**: Added getting-started guide and references demonstrating OS-level command sandboxing using `RunCommandConfig(enable_sandbox=True)` paired with execution policies.
+
+#### Bug Fixes
+- **Tool Call Deserialization**: Fixed dropped tool arguments during tool call handling when incoming payloads provide structured dictionary arguments rather than serialized JSON strings.
+- **Local Step Trajectory Tracking**: Fixed missing provenance metadata by forwarding `trajectory_id` from incoming tool calls to local connection execution steps.
+- **Dynamic Content Proto Resolution**: Fixed an `AttributeError` when importing `struct_converter` in external environments missing internal protobuf definitions by resolving descriptor types dynamically at runtime.
+
+## [0.1.16] - 2026-08-31
+
+This release updates the default model for new agents to `gemini-3.8-flash` for higher quality and reasoning capabilities, alongside improving agent configuration expressiveness, performance for small and local models, and platform connectivity. Developers can now easily configure lightweight agents optimized for local environments via a new fluent method, connect to Vertex AI with API keys in Express mode, and benefit from expanded support for custom tool implementations (functors, dataclasses).
+
+### 🌟 Key Highlights
+- **Default Model Update to Gemini 3.8 Flash**: The default model for new agents and configurations has been updated to `gemini-3.8-flash`, delivering higher reasoning quality and stronger task performance. Developers can override this default by specifying `model` in their configuration:
+  ```python
+  from antigravity.connections.local import LocalAgentConfig
+
+  config = LocalAgentConfig(model="gemini-3.7-flash")
+  ```
+
+- **Optimized Lightweight Agent Configuration**: New `.lightweight()` method on agent configurations (including `LocalAgentConfig`) and its subclasses applies preset optimizations for smaller, local-running models. This configures a minimal tool set, minimal system prompting, and disables background subagents to reduce context exhaustion and latency.
+  ```python
+  import os
+  from antigravity.connections.local import LiteRTAgentConfig
+
+  config = LiteRTAgentConfig(
+      model_path=os.path.expanduser(
+          "~/.litert-lm/models/gemma4-26b/model.litertlm"
+      )
+  ).lightweight()
+  ```
+
+- **Vertex AI Express Mode (API Key Support)**: Developers can now connect to Vertex AI using Express mode by providing an API key directly on `LocalAgentConfig(vertex=True, api_key="...")`, simplifying authentication without needing full GCP project/location ADC setup.
+  ```python
+  from antigravity.connections.local import LocalAgentConfig
+
+  # Express Mode using API Key
+  config = LocalAgentConfig(vertex=True, api_key="AIza...")
+  ```
+
+- **Support for Callable Class and Dataclass Tools**: The SDK's tool runner, `ToolRunner`, now correctly inspects and executes tools defined as callable class instances (functors) and dataclass methods, enhancing flexibility for custom tool implementation.
+  ```python
+  class MyTool:
+    def __call__(self, context: ToolContext, *args):
+        # ... tool logic
+        pass
+
+  agent.config.add_tool(MyTool())
+  ```
+
+- **Stop Hook Integration**: Agents now support the `StopHook` lifecycle hook, which is triggered when an agent's execution is externally requested to stop. This enables developers to implement custom cleanup, messaging, or resource logging actions upon termination.
+  ```python
+  class CleanupHook(hooks.StopHook):
+    def on_stop(self, agent: Agent):
+      print("Agent stopped. Performing cleanup.")
+  ```
+
+### 📋 Detailed Changes
+
+#### Model & Default Changes
+- **Default Model Update**: The default model for new agents and configurations is now `gemini-3.8-flash`. This change provides higher output quality and reasoning capabilities. To override this default, simply specify the `model` parameter during agent configuration:
+  ```python
+  from antigravity.connections.local import LocalAgentConfig
+  
+  config = LocalAgentConfig(model="gemini-3.7-flash")
+  ```
+
+#### Features & Enhancements
+- **OS Sandbox Opt-in for Commands**: Added an `enable_sandbox` field to `RunCommandConfig` to allow developers to optionally execute terminal commands within an OS-level sandbox environment for enhanced security.
+  ```python
+  from antigravity.types import RunCommandConfig
+  
+  config.capabilities.run_command_config = RunCommandConfig(
+      enable_sandbox=True
+  )
+  ```
+- **Tool Invocation Argument Flexibility**: `ToolWithSchema` and public callable proxies now accept both positional (`*args`) and keyword arguments (`**kwargs`) when called, matching standard Python function calling conventions.
+- **Support for `genai.Content` Media**: Introduced a structconverter to support media blocks from `genai.Content` objects within the SDK, enabling richer multimodal interactions.
+- **MCP Compatibility Widening**: The SDK now supports both `mcp>=1.0` and `mcp<3.0` dependencies, ensuring compatibility with new and existing MCP environments.
+
+#### Bug Fixes & Deprecations
+- **Agent Behavior Fix for Interactive Examples**: Corrected an issue where interactive SDK examples (`interactive_cli.py`, `human_in_the_loop.py`, etc.) were not consistently configured with `AgentBehavior.INTERACTIVE`, ensuring proper question asking and hook activation.
+- **Tool Runner Execution Environment Fix**: Resolved a failure in exported SDK examples (e.g., in CI environments) where `stdio` MCP servers were executed improperly. Child processes now correctly use `sys.executable` to run within the active Python virtual environment.
+
+- **DEPRECATION: Step Token Usage**: `Step.usage_metadata` has been deprecated. Usage reporting is now consolidated at the turn-level (`ChatResponse.usage_metadata`) and session-level (`agent.conversation.total_usage`) to provide a more accurate metric, as a single model invocation often maps to multiple execution steps.
+
+## [0.1.15] - 2026-08-25
+
+Antigravity Python SDK v0.1.15 introduces subagent-exclusive tool scoping to reduce context overhead, adds an `on_compaction` lifecycle hook for observing context checkpointing, expands platform compatibility with Alpine Linux musl wheels, resolves workspace path normalization and custom Vertex endpoint routing, and adds universal JSON Schema normalization for custom Python tools when targeting local OpenAI-compatible LLM endpoints.
+
+### 🌟 Key Highlights
+- **Subagent-Scoped Custom Tools**: Custom tools can now be registered directly on subagents without requiring registration on the root agent. Subagent-specific tools are strictly isolated to the subagent's execution context and will not leak into the root agent's prompt or consume root context tokens.
+- **Context Compaction Lifecycle Hook**: Improved support for the `on_compaction` lifecycle hook to more precisely capture compaction events and summaries whenever long-running conversations trigger checkpointing.
+- **Custom Base URL & Secure Vertex Proxy Support**: `VertexEndpoint` now supports routing requests to custom `base_url` reverse proxies or enterprise gateways without leaking ambient Google Cloud Application Default Credentials (ADC) OAuth tokens or conflicting with project/location configurations.
+- **Universal JSON Schema Normalization for Custom Tools**: Custom Python tools now produce standard OpenAPI / JSON Schema compliant parameter definitions with lowercase types and camelCase combiners, eliminating HTTP 400 Bad Request schema errors when connecting to local OpenAI-compatible engines such as Ollama, LM Studio, or vLLM.
+
+---
+
+### 📋 Detailed Changes
+
+#### Features & Enhancements
+- **`from_bytes` Helper Export**: Exported the `from_bytes` helper in top-level `google.antigravity` alongside `from_file` for creating binary/multimodal content payloads.
+- **PEP 656 musllinux Wheel Support**: Added `musllinux_1_1` wheel platform tags for x86_64 and aarch64 architectures, enabling direct installation via pip on Alpine Linux containers.
+- **Isolated Harness Environment Configuration**: Added per-connection environment dictionary resolution for `ANTIGRAVITY_HARNESS_PATH`, avoiding the need to mutate global `os.environ`.
+- **Tool Call Metadata Preservation**: Preserved `id`, `step_id`, and `server_name` metadata across all `ToolResult` executions, including batch calls, errors, and unknown tools.
+
+#### Model & Default Changes
+- **Relative Workspace Path Normalization**: `LocalAgentConfig(workspaces=...)` now resolves relative directory paths and tilde (`~`) expansions against the current working directory (`os.getcwd()`). Previously, relative paths were passed unresolved to the harness and interpreted as absolute root paths, causing workspace indexing failures. Pass absolute paths or `pathlib.Path` instances if referencing directories outside the current working tree.
+- **Deprecated `TriggerDelivery` Removal**: Removed the unused `TriggerDelivery` enum from `types.py`.
+
+#### Bug Fixes
+- **Local OpenAI Tool Schema Validation**: Fixed HTTP 400 "Invalid discriminator value" errors on local OpenAI endpoints by canonicalizing tool parameter schemas to standard JSON Schema.
+- **Vertex Custom Gateway Token Leaks**: Fixed host GCP OAuth bearer token leakage and environment variable collisions when using custom `base_url` endpoints with `VertexEndpoint`.
+- **Subagent Custom Tool Routing**: Fixed tool dispatch failures when subagents defined tools not registered on the root agent.
+- **`UsageMetadata` Service Tier Loss**: Fixed `UsageMetadata.__sub__` dropping the `service_tier` field when calculating per-turn usage deltas.
+- **WebSocket Deprecation Warnings**: Resolved `DeprecationWarning` exceptions when reading WebSocket close codes across varying websockets library versions.
+- **OpenTelemetry Optional Dependency Guard**: Fixed test collection failures on minimal environments lacking `opentelemetry.sdk`.
+
+## [0.1.14] - 2026-08-21
+
+Bug fixes:
+- https://github.com/google-antigravity/antigravity-sdk-python/issues/183
+- https://github.com/google-antigravity/antigravity-sdk-python/issues/181
+- https://github.com/google-antigravity/antigravity-sdk-python/issues/167
+
+## [0.1.13] - 2026-08-18
+
+This release introduces pre-tool argument modification capabilities in lifecycle hooks, adds native support for synchronous hook functions, and establishes structured command execution configuration with configurable execution timeouts. It also improves tool execution observability with step correlation IDs, and enhances connection resilience during client disconnects.
+
+### 🌟 Key Highlights
+- **Pre-Tool Hook Argument Modification**: Pre-tool lifecycle hooks can now sanitize, transform, or override tool input arguments before tool execution begins.
+  ```python
+  @pre_tool
+  def sanitize_args(event: PreToolHookEvent) -> PreToolHookDecision:
+      return PreToolHookDecision(allow=True, modified_args={"query": event.args["query"].strip()})
+  ```
+
+- **Synchronous Hook Function Support**: Lifecycle hook decorators now accept standard synchronous functions alongside asynchronous coroutines without raising runtime await errors.
+  ```python
+  @pre_turn
+  def log_turn(event: PreTurnHookEvent) -> None:
+      print(f"Executing turn for session: {event.session_id}")
+  ```
+
+- **Structured Command Execution Configuration**: Command execution settings are now consolidated under `RunCommandConfig`, introducing configurable timeouts that default to 10 minutes (600 seconds) alongside daemon execution controls.
+  ```python
+  capabilities = CapabilitiesConfig(
+      run_command_config=RunCommandConfig(timeout_seconds=300, enable_daemons=True)
+  )
+  ```
+
+- **Tool Lifecycle Step Correlation**: `ToolResult` and `ToolExecutionError` event payloads now include `step_id`, enabling end-to-end tracking and correlation of tool invocations across trajectory steps.
+  ```python
+  @post_tool
+  def trace_tool_execution(event: ToolResult) -> None:
+      print(f"Step {event.step_id}: {event.tool_name} returned {event.result}")
+  ```
+
+---
+
+### 📋 Detailed Changes
+
+#### Features & Enhancements
+- **Pre-Tool Hook Argument Modification**: Added the ability for `@pre_tool` hooks to return updated tool arguments that are sequentially chained across registered hooks prior to tool execution.
+- **Tool Step Correlation**: Added `step_id` to `ToolResult` and `ToolExecutionError` hook event models, allowing developers to correlate tool completions and failures with their originating tool call step.
+- **VS Code Debugging Configuration**: Updated `setup_vscode_debugging.sh` to target the canonical `getting_started/hello_world` starter example and explicitly configure Gemini Developer API defaults.
+
+#### Model & Default Changes
+- **Command Timeout and Daemon Configuration**: `CapabilitiesConfig` now has a `RunCommandConfig` allowing configuration of execution timeouts and daemon commands. Timeouts default to 10 minutes (600 seconds) to prevent unresponsive command tasks. Run commands can have daemons enabled via a boolean flag..
+
+#### Bug Fixes
+- **Synchronous Hook Decorator Execution**: Fixed a runtime `TypeError` when decorating synchronous functions with `@pre_turn`, `@post_tool_call`, and other lifecycle hooks by verifying awaitability before awaiting hook responses.
+- **LiteRT Early Client Disconnects**: Suppressed unhandled `ConnectionResetError`, `ConnectionAbortedError`, and `BrokenPipeError` exceptions when clients disconnect early from local LiteRT server connections.
+
+## [0.1.12] - 2026-08-13
+
+This release fixes a regression: https://github.com/google-antigravity/antigravity-sdk-python/issues/172
+
+## [0.1.11] - 2026-08-11
+
+The 0.1.11 release updates the default model to `gemini-3.7-flash`, introduces session-level budget enforcement and turn termination stop reasons, Vertex AI Express Mode authentication and a new agent behavior setting that toggles betweein interactive and autonomous (the default). It also expands tool hook metadata, resolves string annotation coercion for postponed evaluation, and improves MCP server and subagent stability.
+
+### 🌟 Key Highlights
+
+- **Default Model Upgrade to Gemini 3.7 Flash**: Upgraded the default inference model to `gemini-3.7-flash`.
+- **Session Budget Enforcement & Stop Reasons**: Added `BudgetConfig` to define session-level usage limits (model invocations, tool invocations, and token budgets) and `StopReason` enum (`MAX_MODEL_CALLS_EXCEEDED`, `MAX_TOOL_CALLS_EXCEEDED`, `MAX_TOTAL_TOKENS_EXCEEDED`, `QUOTA_EXHAUSTED`, etc.) to inspect turn termination causes.
+- **Vertex AI Express Mode Support**: Added native support for Express Mode authentication via `VertexEndpoint(api_key=...)` and `LocalAgentConfig(vertex=true, api_key=...)`, simplifying headless and non-GCP deployments.
+- **Autonomous Agent Behavior Mode**: Control the agent's behavior with `AgentBehavior`. By default the SDK now has a `AgentBehavior.AUTONOMOUS` mode (used to be `AgentBehavior.INTERACTIVE`) to streamline scripting, background and headless interactions modes.
+- **Multi-Interface Hook Registration**: Enabled single-instance registration across multiple hook interfaces (`PreToolHook`, `PostToolHook`, `PreTurnHook`), allowing for cross functional instrumentation.
+
+### 🔧 Detailed Changes
+
+#### New Features
+- **Budget Enforcement**: Introduced `BudgetConfig(max_model_calls, max_tool_calls, max_input_tokens, max_output_tokens, max_total_tokens)` and exposed stop reason metadata on turn responses.
+- **Express Mode API Key Auth**: Added `api_key` support across `VertexEndpoint` and local agent configurations.
+- **Multi-Interface Hooks**: Supported registering composite hook classes without duplicate invocation.
+- **PreToolArgs Metadata**: Exposed `step_id` on tool hook payloads for chat thread context tracing.
+
+#### Model & Default Changes
+- **Default Model Upgrade**: Updated the default model from `gemini-3.6-flash` to `gemini-3.7-flash`.
+- **Agent Behavior**: Introduced the ability to control `AgentBehavior`. Now defaults to autonomous (form interactive) to avoid unexpected interactive pause states during script execution. Override by setting `CapabilitiesConfig(agent_behavior=AgentBehavior.INTERACTIVE)`.
+
+#### Bug Fixes & Maintenance
+- **ToolRunner String Annotation Coercion**: When using `from __future__ import annotations`, tool argument coercion failed on stringified types; resolved by resolving type annotations via `typing.get_type_hints` before type adaptation.
+- **MCP Server Example Port Binding**: Ephemeral port race conditions in test and example server startup were resolved by binding directly to port 0.
+- **Subagent Deadlock Prevention**: Handled subagent fatal errors in the localagent executor to prevent deadlocks when subagents terminate abnormally.
+- **Empty Input Validation**: Added input validation to prevent SDK unresponsiveness on empty or whitespace-only prompts.
 
 ## [0.1.10] - 2026-08-04
 
@@ -15,12 +330,24 @@ The 0.1.10 release introduces support for Gemini Prioritized Inference service t
 
 - **Gemini Prioritized Inference Service Tier**: Configure agents to utilize Gemini Prioritized Inference service tiers for high-priority model execution with automated graceful fallback.
   ```python
-  from google.antigravity import GeminiAPIEndpoint, LocalAgentConfig, types
+  from google.antigravity import (
+      GeminiAPIEndpoint,
+      GeminiModelOptions,
+      LocalAgentConfig,
+      ModelTarget,
+      types,
+  )
 
   # Configure priority inference via GeminiAPIEndpoint
-  options = types.GeminiModelOptions(service_tier=types.ServiceTier.PRIORITY)
-  endpoint = GeminiAPIEndpoint(options=options)
-  config = LocalAgentConfig(endpoint=endpoint)
+  model_opts = GeminiModelOptions(
+      service_tier=types.ServiceTier.PRIORITY,
+  )
+  config = LocalAgentConfig(
+      model=ModelTarget(
+          name="gemini-3.6-flash",
+          endpoint=GeminiAPIEndpoint(options=model_opts),
+      ),
+  )
   ```
 
 - **Tool Call ID Correlation in Lifecycle Hooks**: Inspect `call_id` attributes on tool executions, errors, and hooks to correlate multi-step tool invocations across lifecycle callbacks.
@@ -45,7 +372,7 @@ The 0.1.10 release introduces support for Gemini Prioritized Inference service t
 
   @hooks.pre_turn
   async def inspect_prompt(context: HookContext, data: str) -> types.HookResult:
-      context["user_prompt"] = data
+      context.set_state("user_prompt", data)
       return types.HookResult(allow=True)
   ```
 

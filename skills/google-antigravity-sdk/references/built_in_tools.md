@@ -1,15 +1,18 @@
 # Built-in Tools Reference
 
-In the `LocalAgentConfig` (used for local development), all built-in tools are
-**enabled** by default. However, `run_command` is **denied** by the default
-`confirm_run_command()` policy — all other tools are allowed. See
+In the `LocalAgentConfig` (used for local development), most built-in tools are
+**enabled** by default (except `ASK_QUESTION`, `LIST_DIR`, `SEARCH_DIR`, and
+`FIND_FILE`, which are disabled by default and can be opted into via
+`enabled_tools`).
+However, `run_command` is **denied** by the default
+`confirm_run_command()` policy — all other enabled tools are allowed. See
 [Safety Policies](safety_policies.md) to customize this behavior.
 
 > [!NOTE]
-> Agents default to `agent_mode=AgentMode.AUTONOMOUS`. When using interactive
-> tools like `BuiltinTools.ASK_QUESTION`, configure
-> `agent_mode=AgentMode.INTERACTIVE` in `CapabilitiesConfig` so the agent
-> actively collaborates with and prompts the user.
+> Agents default to `agent_behavior=AgentBehavior.AUTONOMOUS`. When using
+> interactive tools like `BuiltinTools.ASK_QUESTION`, configure
+> `agent_behavior=AgentBehavior.INTERACTIVE` in `CapabilitiesConfig` so the
+> agent actively collaborates with and prompts the user.
 
 To override a built-in tool with a custom implementation, you can define a
 custom tool with the same name. See
@@ -22,10 +25,13 @@ descriptions.
 | Tool Enum                     | Tool Name          | Description            |
 | ----------------------------- | ------------------ | ---------------------- |
 | `BuiltinTools.LIST_DIR`       | `list_directory`   | List directory         |
-:                               :                    : contents.              :
+:                               :                    : contents (off by       :
+:                               :                    : default).              :
 | `BuiltinTools.SEARCH_DIR`     | `search_directory` | Search within          |
-:                               :                    : directories.           :
-| `BuiltinTools.FIND_FILE`      | `find_file`        | Find files by name.    |
+:                               :                    : directories (off by    :
+:                               :                    : default).              :
+| `BuiltinTools.FIND_FILE`      | `find_file`        | Find files by name     |
+:                               :                    : (off by default).      :
 | `BuiltinTools.VIEW_FILE`      | `view_file`        | View file contents.    |
 | `BuiltinTools.FINISH`         | `finish`           | Finish and return      |
 :                               :                    : output.                :
@@ -44,3 +50,9 @@ descriptions.
 
 > [!NOTE] Some production backends may require additional environment or
 > filesystem configuration to support these tools.
+
+> [!NOTE] `run_command` can be hardened by executing shell commands inside an
+> OS-level sandbox. Set `enable_sandbox=True` on `RunCommandConfig` (nested
+> under `CapabilitiesConfig.run_command_config`). See
+> [Safety Policies](safety_policies.md#defense-in-depth-os-level-command-sandboxing)
+> for details and caveats.

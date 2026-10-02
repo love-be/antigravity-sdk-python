@@ -12,39 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Example demonstrating subagents in Google Antigravity SDK.
+"""Example demonstrating subagents and nested hierarchies in Google Antigravity SDK.
 
-This example shows two subagent scenarios:
-  1. Dynamic Subagent: The agent dynamically spawns a clone of itself ("self")
-     to delegate a heavy research task (listing/reading files), keeping its
-     own context window clean.
-  2. Custom Static Subagent: The agent is pre-configured with a custom, static
-     subagent definition ('code_reviewer') that has its own system instructions
-     and custom tools (e.g. get_reviewer_badge).
+This script demonstrates three core subagent workflows:
+  - Dynamic Self-Delegation: The agent dynamically spawns a clone of itself
+    ("self") to delegate a heavy research task while keeping its own context
+    window clean.
+  - Custom Static Subagents: An agent configured with a dedicated static
+    subagent definition ('code_reviewer') with scoped tools and custom system
+    instructions.
+  - Hierarchical Nested Subagents: A multi-tier delegation chain using
+    max_subagent_depth and allowed_subagents scoping ('root' ->
+    'lead_researcher'
+    -> 'fact_checker').
 
 To run:
   python subagents.py
 
 Criteria for correct script performance:
   1. The script exits cleanly with return code 0 (no unhandled exceptions).
-  2. In Scenario 1, the agent dynamically spawns a subagent to research the
-     examples directory.
-  3. In Scenario 1, the agent produces a non-empty lesson plan.
-  4. In Scenario 2, the 'code_reviewer' subagent audits target_code.py,
-     producing warnings prefixed with '[AUDIT_WARNING]'.
-  5. In Scenario 2, the subagent uses the 'get_reviewer_badge' tool to sign the
-     report with 'Senior-L3-Auditor-Badge'.
-  6. In Scenario 2, the 'code_reviewer' subagent only has access to its
-     allowlisted tool ('get_reviewer_badge') and cannot call unlisted root
-     tools ('get_root_admin_secret').
-  7. Subagent hook logs fire for both scenarios, showing start/done events.
+  2. The dynamic subagent delegates researching the directory and produces a
+     lesson plan.
+  3. The 'code_reviewer' subagent audits mcp_server.py, producing warnings
+     prefixed with '[AUDIT_WARNING]'.
+  4. The subagent uses the 'get_reviewer_badge' tool to sign the report with
+     'Senior-L3-Auditor-Badge'.
+  5. The 'code_reviewer' subagent only has access to its allowlisted tool
+     ('get_reviewer_badge') and cannot call unlisted root tools
+     ('get_root_admin_secret').
+  6. Subagent hook logs fire for all workflows, showing start/done events.
+  7. The hierarchical delegation workflow successfully delegates from the root
+     agent to 'lead_researcher', which further delegates to 'fact_checker',
+     respecting max_subagent_depth=3 and allowed_subagents scoping.
 """
 
 import asyncio
 import logging
 import pathlib
 import sys
-import tempfile
 from typing import Any
 
 from google.antigravity import Agent
@@ -52,6 +57,7 @@ from google.antigravity import LocalAgentConfig
 from google.antigravity import types
 from google.antigravity.hooks import hooks
 
+_RESOURCES_DIR = pathlib.Path(__file__).resolve().parent.parent / "resources"
 _subagent_active = False
 
 
@@ -95,22 +101,20 @@ def get_root_admin_secret() -> str:
 
 
 async def run_dynamic_subagent() -> None:
-  """Runs a dynamic subagent research scenario."""
-  print("\n=== Scenario 1: Dynamic Subagent (Self Clone) ===")
-  # Enable subagents in the config and add hooks for visibility.
+  """Runs a dynamic self-delegation research workflow."""
+  print("\n=== Dynamic Subagent (Self Clone) ===")
+  # Subagents are enabled by default on LocalAgentConfig.
   config = LocalAgentConfig(
-      capabilities=types.CapabilitiesConfig(
-          enable_subagents=True,
-      ),
+      workspaces=[str(_RESOURCES_DIR)],
       hooks=[log_pre_tool, log_post_tool],
   )
 
   async with Agent(config) as my_agent:
     prompt = (
-        "Use a subagent to research the Google Antigravity SDK examples in"
-        " the parent directory. Delegate the task of listing and reading the"
-        " files to the subagent, and then generate a lesson plan for me to"
-        " learn more based on its findings."
+        "Use a subagent to research the example files in the resources"
+        " directory. Delegate the task of listing and reading the files to the"
+        " subagent, and then generate a lesson plan for me to learn more"
+        " based on its findings."
     )
     print(f"  User: {prompt}")
     response = await my_agent.chat(prompt)
@@ -119,84 +123,131 @@ async def run_dynamic_subagent() -> None:
 
 
 async def run_custom_static_subagent() -> None:
-  """Runs a custom static subagent code-review audit scenario."""
-  print("\n=== Scenario 2: Custom Static Subagent ===")
-  with tempfile.TemporaryDirectory() as tmpdir:
-    workspace_path = pathlib.Path(tmpdir) / "workspace"
-    workspace_path.mkdir(parents=True, exist_ok=True)
+  """Runs a custom static subagent code-review audit workflow."""
+  print("\n=== Custom Static Subagent ===")
+  reviewer_subagent = types.SubagentConfig(
+      name="code_reviewer",
+      description="Audits source code files and reports missing docstrings.",
+      system_instructions=(
+          "You are a code reviewer. Read python files in the workspace and "
+          "check if all function declarations have docstrings. For each "
+          "function that is missing a docstring, output a warning prefixed "
+          "with '[AUDIT_WARNING]'. "
+          "CRITICAL: Every warning you output MUST start with "
+          "'[AUDIT_WARNING]'. Use the 'get_reviewer_badge' tool to sign "
+          "your final audit report with your official badge name. "
+          "Also verify that you do not have access to any secret tools "
+          "such as 'get_root_admin_secret' or any other root admin tools. "
+          "State explicitly in your report that you only have access to "
+          "your allowlisted reviewer tools and cannot call unlisted root "
+          "tools. Output your report directly in your final response. Do not "
+          "use the send_message tool to deliver it."
+      ),
+      tools=[get_reviewer_badge],
+  )
 
-    # Write a target file for the reviewer subagent to check.
-    target_file = workspace_path / "target_code.py"
-    target_file.write_text(
-        "def hello():\n"
-        "  print('hello')\n"
-        "\n"
-        "def add(a, b):\n"
-        "  \"\"\"Adds two numbers.\"\"\"\n"
-        "  return a + b\n",
-        encoding="utf-8",
+  config = LocalAgentConfig(
+      subagents=[reviewer_subagent],
+      workspaces=[str(_RESOURCES_DIR)],
+      tools=[get_reviewer_badge, get_root_admin_secret],
+      hooks=[log_pre_tool, log_post_tool],
+  )
+
+  async with Agent(config) as my_agent:
+    prompt = (
+        "Ask the 'code_reviewer' subagent to review mcp_server.py, sign the"
+        " report with their reviewer badge name, and verify whether they have"
+        " access to the 'get_root_admin_secret' tool. Show me the exact"
+        " warnings it produced verbatim (`[AUDIT_WARNING]`), the badge"
+        " signature, and its verification that it cannot call"
+        " 'get_root_admin_secret' or access root secrets."
+    )
+    print(f"  User: {prompt}")
+
+    response = await my_agent.chat(prompt)
+    response_text = await response.text()
+    print(f"\n  Agent:\n{response_text}")
+
+    # Print verification checks for developer reference:
+    print("\n  === Verification Results ===")
+    has_warning = "[AUDIT_WARNING]" in response_text
+    print(
+        f"  {'[PASS]' if has_warning else '[FAIL]'} Custom system prompt"
+        " '[AUDIT_WARNING]' prefix check"
+    )
+    has_badge = "Senior-L3-Auditor-Badge" in response_text
+    print(
+        f"  {'[PASS]' if has_badge else '[FAIL]'} Allowlisted tool access"
+        " ('Senior-L3-Auditor-Badge' signature) check"
+    )
+    no_secret = "SUPER_SECRET_ROOT_PASSWORD_12345" not in response_text
+    print(
+        f"  {'[PASS]' if no_secret else '[FAIL]'} Root secret isolation check"
+        " (get_root_admin_secret not called)"
     )
 
-    reviewer_subagent = types.SubagentConfig(
-        name="code_reviewer",
-        description="Audits source code files and reports missing docstrings.",
-        system_instructions=(
-            "You are a code reviewer. Read python files in the workspace and "
-            "check if all function declarations have docstrings. For each "
-            "function that is missing a docstring, output a warning prefixed "
-            "with '[AUDIT_WARNING]'. "
-            "CRITICAL: Every warning you output MUST start with "
-            "'[AUDIT_WARNING]'. Use the 'get_reviewer_badge' tool to sign "
-            "your final audit report with your official badge name. "
-            "Also verify that you do not have access to any secret tools "
-            "such as 'get_root_admin_secret' or any other root admin tools. "
-            "State explicitly in your report that you only have access to "
-            "your allowlisted reviewer tools and cannot call unlisted root "
-            "tools. Output your report directly in your final response. Do not "
-            "use the send_message tool to deliver it."
-        ),
-        tools=[get_reviewer_badge],
+
+async def run_nested_subagent_hierarchy() -> None:
+  """Runs a 3-tier nested subagent hierarchy workflow."""
+  print("\n=== Hierarchical Nested Subagents ===")
+  # Tier 3 (leaf): A fact-checker that can read files but cannot spawn
+  # further subagents.
+  fact_checker = types.SubagentConfig(
+      name="fact_checker",
+      description=(
+          "Reads specific files and verifies factual claims. Reports"
+          " findings back to the caller."
+      ),
+      capabilities=types.SubagentCapabilities(
+          enabled_tools=[
+              types.BuiltinTools.VIEW_FILE,
+              types.BuiltinTools.FIND_FILE,
+          ],
+      ),
+  )
+
+  # Tier 2 (middle): A lead researcher that can delegate to fact_checker.
+  lead_researcher = types.SubagentConfig(
+      name="lead_researcher",
+      description=(
+          "Researches a topic by reading files and delegating fact-checking"
+          " to the 'fact_checker' subagent."
+      ),
+      capabilities=types.SubagentCapabilities(
+          enabled_tools=[
+              types.BuiltinTools.VIEW_FILE,
+              types.BuiltinTools.FIND_FILE,
+              types.BuiltinTools.LIST_DIR,
+              types.BuiltinTools.START_SUBAGENT,
+          ],
+          allowed_subagents=["fact_checker"],
+      ),
+  )
+
+  # Tier 1 (root): The main agent with a session-wide depth ceiling.
+  config = LocalAgentConfig(
+      subagents=[lead_researcher, fact_checker],
+      workspaces=[str(_RESOURCES_DIR)],
+      capabilities=types.CapabilitiesConfig(
+          max_subagent_depth=3,
+          allowed_subagents=["lead_researcher"],
+      ),
+      hooks=[log_pre_tool, log_post_tool],
+  )
+
+  async with Agent(config) as my_agent:
+    prompt = (
+        "Use the 'lead_researcher' subagent to investigate the MCP server"
+        " and sample document in the workspace. The lead_researcher should"
+        " delegate fact-checking of specific claims (such as the secret"
+        " number in sample_doc.txt or math operations in mcp_server.py) to"
+        " 'fact_checker'. Give me a summary of the server architecture and"
+        " verified facts."
     )
-
-    config = LocalAgentConfig(
-        subagents=[reviewer_subagent],
-        workspaces=[str(workspace_path)],
-        tools=[get_reviewer_badge, get_root_admin_secret],
-        hooks=[log_pre_tool, log_post_tool],
-    )
-
-    async with Agent(config) as my_agent:
-      prompt = (
-          f"Ask the 'code_reviewer' subagent to review {target_file.name}, sign"
-          " the report with their reviewer badge name, and verify whether they"
-          " have access to the 'get_root_admin_secret' tool. Show me the exact"
-          " warnings it produced verbatim (`[AUDIT_WARNING]`), the badge"
-          " signature, and its verification that it cannot call"
-          " 'get_root_admin_secret' or access root secrets."
-      )
-      print(f"  User: {prompt}")
-
-      response = await my_agent.chat(prompt)
-      response_text = await response.text()
-      print(f"\n  Agent:\n{response_text}")
-
-      # Print verification checks for developer reference:
-      print("\n  === Verification Results ===")
-      has_warning = "[AUDIT_WARNING]" in response_text
-      print(
-          f"  {'[PASS]' if has_warning else '[FAIL]'} Custom system prompt"
-          " '[AUDIT_WARNING]' prefix check"
-      )
-      has_badge = "Senior-L3-Auditor-Badge" in response_text
-      print(
-          f"  {'[PASS]' if has_badge else '[FAIL]'} Allowlisted tool access"
-          " ('Senior-L3-Auditor-Badge' signature) check"
-      )
-      no_secret = "SUPER_SECRET_ROOT_PASSWORD_12345" not in response_text
-      print(
-          f"  {'[PASS]' if no_secret else '[FAIL]'} Root secret isolation check"
-          " (get_root_admin_secret not called)"
-      )
+    print(f"  User: {prompt}")
+    response = await my_agent.chat(prompt)
+    response_text = await response.text()
+    print(f"\n  Agent:\n{response_text}")
 
 
 async def main() -> None:
@@ -214,6 +265,7 @@ async def main() -> None:
 
   await run_dynamic_subagent()
   await run_custom_static_subagent()
+  await run_nested_subagent_hierarchy()
 
 
 if __name__ == "__main__":

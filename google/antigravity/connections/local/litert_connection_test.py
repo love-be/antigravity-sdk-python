@@ -14,8 +14,10 @@
 
 """Unit tests for LiteRTConnectionStrategy and LiteRTAgentConfig."""
 
+import http.server
 import json
 import logging
+import socketserver
 import sys
 from typing import Any
 import unittest
@@ -167,6 +169,10 @@ from google.antigravity import types
 from google.antigravity.connections.local import litert_connection
 from google.antigravity.connections.local import litert_connection_config
 from google.antigravity.connections.local import litert_server
+from google.antigravity.connections.local import local_connection
+from google.antigravity.connections.local import test_utils
+from google.antigravity.hooks import policy
+from google.antigravity.tools import tool_runner as tool_runner_mod
 
 # pylint: enable=g-import-not-at-top
 
@@ -175,6 +181,10 @@ _urlopen_no_proxy = litert_connection._urlopen_no_proxy
 
 
 class LiteRTConnectionTest(unittest.IsolatedAsyncioTestCase):
+
+  def setUp(self):
+    super().setUp()
+    test_utils.patch_default_binary_path(self)
 
   @mock.patch("os.path.exists")
   @mock.patch("subprocess.Popen")
@@ -342,27 +352,181 @@ class LiteRTConnectionTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(model.gemma_endpoint.base_url, "http://127.0.0.1:54321")
 
   @mock.patch("os.path.exists")
-  def test_litert_config_max_context_tokens(self, mock_exists):
+  def test_litert_config_compaction_config(self, mock_exists):
     mock_exists.return_value = True
     config = litert_connection_config.LiteRTAgentConfig(
         model_path="/tmp/model.litertlm",
         backend=litert_connection_config.LiteRTBackend.CPU,
-        max_context_tokens=12345,
+        compaction_config=types.CompactionConfig(
+            token_threshold=12345,
+        ),
     )
-    self.assertEqual(config.max_context_tokens, 12345)
+    self.assertEqual(config.compaction_config.token_threshold, 12345)
     strategy = config.create_strategy(
         tool_runner=mock.MagicMock(),
         hook_runner=mock.MagicMock(),
     )
-    self.assertEqual(strategy._max_context_tokens, 12345)
+    self.assertEqual(strategy._max_kv_cache_tokens, 65536)
+    self.assertEqual(strategy._compaction_config.token_threshold, 12345)
+
+  @mock.patch("os.path.exists")
+  def test_litert_config_tool_output_truncation_config(self, mock_exists):
+    """Verify LiteRTAgentConfig forwards capabilities with tool_output_truncation_config to strategy and populates harness."""
+    mock_exists.return_value = True
+    config = litert_connection_config.LiteRTAgentConfig(
+        model_path="/tmp/model.litertlm",
+        backend=litert_connection_config.LiteRTBackend.CPU,
+        capabilities=types.CapabilitiesConfig(
+            tool_output_truncation_config=1024
+        ),
+    )
+    self.assertEqual(
+        config.capabilities.tool_output_truncation_config,
+        types.ToolOutputTruncationConfig(max_tokens=1024),
+    )
+    strategy = config.create_strategy(
+        tool_runner=mock.MagicMock(),
+        hook_runner=mock.MagicMock(),
+    )
+    self.assertEqual(
+        strategy._capabilities_config.tool_output_truncation_config,
+        types.ToolOutputTruncationConfig(max_tokens=1024),
+    )
+    strategy._openai_server_url = "http://127.0.0.1:54321"
+    h_cfg = strategy._build_harness_config()
+    self.assertTrue(h_cfg.HasField("tool_output_truncation"))
+    self.assertTrue(h_cfg.tool_output_truncation.HasField("truncate"))
+    self.assertEqual(h_cfg.tool_output_truncation.truncate.max_tokens, 1024)
 
   def test_litert_config_default_capabilities(self):
-    """Verify LiteRTAgentConfig defaults to all capabilities enabled."""
+    """Verify LiteRTAgentConfig defaults to lightweight preset automatically."""
     litert_config = litert_connection_config.LiteRTAgentConfig(
         model_path="/tmp/model.litertlm",
     )
-    self.assertIsNone(litert_config.capabilities.enabled_tools)
-    self.assertIsNone(litert_config.capabilities.disabled_tools)
+    self.assertEqual(
+        litert_config.capabilities.enabled_tools, types.BuiltinTools.minimal()
+    )
+    self.assertEqual(
+        litert_config.capabilities.agent_behavior, types.AgentBehavior.MINIMAL
+    )
+    self.assertFalse(litert_config.capabilities.enable_subagents)
+    self.assertIsNotNone(litert_config.compaction_config)
+    self.assertEqual(litert_config.compaction_config.token_threshold, 40960)
+
+  def test_litert_config_lightweight_method(self):
+    """Verify LiteRTAgentConfig.lightweight returns LiteRTAgentConfig with defaults."""
+    config = litert_connection_config.LiteRTAgentConfig(
+        model_path="/tmp/model.litertlm",
+        backend=litert_connection_config.LiteRTBackend.CPU,
+    ).lightweight()
+    self.assertIsInstance(config, litert_connection_config.LiteRTAgentConfig)
+    self.assertEqual(config.model_path, "/tmp/model.litertlm")
+    self.assertEqual(config.backend, litert_connection_config.LiteRTBackend.CPU)
+    self.assertEqual(
+        config.capabilities.agent_behavior, types.AgentBehavior.MINIMAL
+    )
+    self.assertEqual(
+        config.capabilities.enabled_tools, types.BuiltinTools.minimal()
+    )
+    self.assertIsNotNone(config.compaction_config)
+    self.assertEqual(config.compaction_config.token_threshold, 40960)
+    self.assertIsNone(config.capabilities.compaction_threshold)
+    self.assertFalse(config.capabilities.enable_subagents)
+
+    strategy = config.create_strategy(
+        tool_runner=mock.MagicMock(),
+        hook_runner=mock.MagicMock(),
+    )
+    self.assertEqual(strategy._max_kv_cache_tokens, 65536)
+    self.assertEqual(strategy._compaction_config.token_threshold, 40960)
+
+  def test_litert_config_lightweight_method_with_overrides(self):
+    """Verify LiteRTAgentConfig.lightweight respects capability overrides."""
+    config = litert_connection_config.LiteRTAgentConfig(
+        model_path="/tmp/model.litertlm",
+        backend=litert_connection_config.LiteRTBackend.CPU,
+        capabilities=types.CapabilitiesConfig(compaction_threshold=3000),
+    ).lightweight()
+    self.assertIsInstance(config, litert_connection_config.LiteRTAgentConfig)
+    self.assertEqual(config.capabilities.compaction_threshold, 3000)
+    self.assertIsNone(config.compaction_config)
+    self.assertEqual(
+        config.capabilities.agent_behavior, types.AgentBehavior.MINIMAL
+    )
+    self.assertEqual(
+        config.capabilities.enabled_tools, types.BuiltinTools.minimal()
+    )
+    self.assertFalse(config.capabilities.enable_subagents)
+
+  def test_litert_config_constructor_with_capability_overrides(self):
+    """Verify LiteRTAgentConfig constructor auto-applies lightweight preset with overrides."""
+    config = litert_connection_config.LiteRTAgentConfig(
+        model_path="/tmp/model.litertlm",
+        backend=litert_connection_config.LiteRTBackend.CPU,
+        capabilities=types.CapabilitiesConfig(compaction_threshold=3000),
+    )
+    self.assertIsInstance(config, litert_connection_config.LiteRTAgentConfig)
+    self.assertEqual(config.capabilities.compaction_threshold, 3000)
+    self.assertIsNone(config.compaction_config)
+    self.assertEqual(
+        config.capabilities.agent_behavior, types.AgentBehavior.MINIMAL
+    )
+    self.assertEqual(
+        config.capabilities.enabled_tools, types.BuiltinTools.minimal()
+    )
+    self.assertFalse(config.capabilities.enable_subagents)
+
+  def test_litert_config_constructor_equals_lightweight_method(self):
+    """Verify LiteRTAgentConfig(...) produces identical configuration to LiteRTAgentConfig(...).lightweight()."""
+    config1 = litert_connection_config.LiteRTAgentConfig(
+        model_path="/tmp/model.litertlm",
+        backend=litert_connection_config.LiteRTBackend.CPU,
+    )
+    config2 = litert_connection_config.LiteRTAgentConfig(
+        model_path="/tmp/model.litertlm",
+        backend=litert_connection_config.LiteRTBackend.CPU,
+    ).lightweight()
+    self.assertEqual(config1.capabilities, config2.capabilities)
+    self.assertEqual(config1.compaction_config, config2.compaction_config)
+    self.assertEqual(config1.model_dump(), config2.model_dump())
+
+  def test_litert_config_lightweight_method_preserves_explicit_compaction_config(
+      self,
+  ):
+    """Verify explicit compaction_config takes priority over lightweight preset."""
+    custom_compaction = types.CompactionConfig(
+        token_threshold=10000,
+    )
+    config = litert_connection_config.LiteRTAgentConfig(
+        model_path="/tmp/model.litertlm",
+        backend=litert_connection_config.LiteRTBackend.CPU,
+        compaction_config=custom_compaction,
+    ).lightweight()
+    self.assertEqual(config.compaction_config, custom_compaction)
+    strategy = config.create_strategy(
+        tool_runner=mock.MagicMock(),
+        hook_runner=mock.MagicMock(),
+    )
+    self.assertEqual(
+        strategy._compaction_config.token_threshold, 10000
+    )
+
+  def test_litert_config_kv_cache_tokens_defaults(self):
+    """Verify LiteRTAgentConfig defaults for KV cache tokens and derived compaction."""
+    config = litert_connection_config.LiteRTAgentConfig(
+        model_path="/tmp/model.litertlm",
+    )
+    self.assertIsNotNone(config.compaction_config)
+    self.assertEqual(config.compaction_config.token_threshold, 40960)
+
+    strategy = config.create_strategy(
+        tool_runner=mock.MagicMock(),
+        hook_runner=mock.MagicMock(),
+    )
+    self.assertEqual(strategy._max_kv_cache_tokens, 65536)
+    self.assertEqual(strategy._max_output_tokens, 16384)
+    self.assertEqual(strategy._thinking_token_budget, 8192)
+    self.assertEqual(strategy._compaction_config.token_threshold, 40960)
 
   @mock.patch("os.path.exists")
   @mock.patch("subprocess.Popen")
@@ -557,11 +721,10 @@ class LiteRTConnectionTest(unittest.IsolatedAsyncioTestCase):
         tool_runner=mock.MagicMock(),
         hook_runner=mock.MagicMock(),
     )
-    with mock.patch.object(
-        strategy, "_shutdown_server"
-    ) as mock_shutdown, mock.patch.object(
-        strategy, "_close_engine"
-    ) as mock_close:
+    with (
+        mock.patch.object(strategy, "_shutdown_server") as mock_shutdown,
+        mock.patch.object(strategy, "_close_engine") as mock_close,
+    ):
       with self.assertRaises(RuntimeError):
         await strategy.__aenter__()
       mock_shutdown.assert_called_once()
@@ -580,10 +743,12 @@ class LiteRTConnectionTest(unittest.IsolatedAsyncioTestCase):
       self.assertEqual(tool.get_tool_description(), {"name": "foo"})
 
   async def test_litert_engine_max_num_tokens_param(self):
-    """Verify max_num_tokens (not max_context_tokens) is passed to litert_lm.Engine."""
+    """Verify max_num_tokens is passed to litert_lm.Engine and decoupled from compaction."""
     config = litert_connection_config.LiteRTAgentConfig(
         model_path="/dummy/path.litertlm",
-        max_context_tokens=4096,
+        compaction_config=types.CompactionConfig(
+            token_threshold=21424,
+        ),
     )
     strategy = config.create_strategy(
         tool_runner=mock.MagicMock(),
@@ -594,14 +759,20 @@ class LiteRTConnectionTest(unittest.IsolatedAsyncioTestCase):
     mock_engine_cls.return_value = mock_engine_inst
     mock_engine_inst.__enter__.return_value = mock.MagicMock()
 
-    with mock.patch.object(
-        litert_connection, "litert_lm"
-    ) as mock_lm, mock.patch.object(
-        litert_connection.litert_server, "LiteRTOpenAIServer"
-    ), mock.patch.object(
-        litert_connection, "_urlopen_no_proxy"
-    ) as mock_urlopen, mock.patch(
-        "os.path.exists", return_value=True
+    with (
+        mock.patch.object(litert_connection, "litert_lm") as mock_lm,
+        mock.patch.object(
+            litert_connection.litert_server, "LiteRTOpenAIServer"
+        ),
+        mock.patch.object(
+            litert_connection, "_urlopen_no_proxy"
+        ) as mock_urlopen,
+        mock.patch("os.path.exists", return_value=True),
+        mock.patch.object(
+            local_connection.LocalConnectionStrategy,
+            "__aenter__",
+            return_value=None,
+        ),
     ):
       mock_resp = mock.MagicMock()
       mock_resp.status = 200
@@ -618,7 +789,54 @@ class LiteRTConnectionTest(unittest.IsolatedAsyncioTestCase):
       _, kwargs = mock_engine_cls.call_args
       self.assertIn("max_num_tokens", kwargs)
       self.assertNotIn("max_context_tokens", kwargs)
-      self.assertEqual(kwargs["max_num_tokens"], 4096)
+      self.assertEqual(kwargs["max_num_tokens"], 65536)
+      self.assertEqual(strategy._compaction_config.token_threshold, 21424)
+
+  async def test_litert_engine_lightweight_decoupled_limits(self):
+    """Verify lightweight preset passes max_kv_cache_tokens to Engine while deriving compaction."""
+    config = litert_connection_config.LiteRTAgentConfig(
+        model_path="/dummy/path.litertlm",
+    ).lightweight()
+    strategy = config.create_strategy(
+        tool_runner=mock.MagicMock(),
+        hook_runner=mock.MagicMock(),
+    )
+    mock_engine_cls = mock.MagicMock()
+    mock_engine_inst = mock.MagicMock()
+    mock_engine_cls.return_value = mock_engine_inst
+    mock_engine_inst.__enter__.return_value = mock.MagicMock()
+
+    with (
+        mock.patch.object(litert_connection, "litert_lm") as mock_lm,
+        mock.patch.object(
+            litert_connection.litert_server, "LiteRTOpenAIServer"
+        ),
+        mock.patch.object(
+            litert_connection, "_urlopen_no_proxy"
+        ) as mock_urlopen,
+        mock.patch("os.path.exists", return_value=True),
+        mock.patch.object(
+            local_connection.LocalConnectionStrategy,
+            "__aenter__",
+            return_value=None,
+        ),
+    ):
+      mock_resp = mock.MagicMock()
+      mock_resp.status = 200
+      mock_resp.__enter__.return_value = mock_resp
+      mock_urlopen.return_value = mock_resp
+      mock_lm.Engine = mock_engine_cls
+      mock_lm.Backend.CPU.return_value = "CPU"
+      try:
+        await strategy.__aenter__()
+      finally:
+        await strategy.__aexit__(None, None, None)
+
+      mock_engine_cls.assert_called_once()
+      _, kwargs = mock_engine_cls.call_args
+      self.assertEqual(kwargs["max_num_tokens"], 65536)
+      self.assertEqual(strategy._max_kv_cache_tokens, 65536)
+      self.assertEqual(strategy._compaction_config.token_threshold, 40960)
 
   def test_litert_config_mcp_servers_and_subagents_passed_to_strategy(self):
     """Verify LiteRTAgentConfig passes mcp_servers and subagents to strategy."""
@@ -644,7 +862,10 @@ class LiteRTConnectionTest(unittest.IsolatedAsyncioTestCase):
 
   def test_litert_logging_defaults_to_silent(self):
     """Verify LiteRT logging defaults to SILENT (non-verbose)."""
-    with mock.patch.object(litert_connection, "litert_lm") as mock_litert_lm:
+    with (
+        mock.patch.object(litert_connection, "litert_lm") as mock_litert_lm,
+        mock.patch.object(logging.Logger, "isEnabledFor", return_value=False),
+    ):
       mock_litert_lm.LogSeverity.SILENT = 1000
       mock_litert_lm.set_min_log_severity = mock.MagicMock()
       config = litert_connection_config.LiteRTAgentConfig(
@@ -655,6 +876,29 @@ class LiteRTConnectionTest(unittest.IsolatedAsyncioTestCase):
           hook_runner=mock.MagicMock(),
       )
       mock_litert_lm.set_min_log_severity.assert_called_with(1000)
+
+  def test_litert_logging_defaults_to_silent_with_ambient_debug_logger(self):
+    """Verify LiteRT logging is SILENT when debug check is isolated despite ambient debug loggers."""
+    root_logger = logging.getLogger()
+    old_level = root_logger.level
+    try:
+      root_logger.setLevel(logging.DEBUG)
+      with (
+          mock.patch.object(litert_connection, "litert_lm") as mock_litert_lm,
+          mock.patch.object(logging.Logger, "isEnabledFor", return_value=False),
+      ):
+        mock_litert_lm.LogSeverity.SILENT = 1000
+        mock_litert_lm.set_min_log_severity = mock.MagicMock()
+        config = litert_connection_config.LiteRTAgentConfig(
+            model_path="/tmp/model.litertlm",
+        )
+        config.create_strategy(
+            tool_runner=mock.MagicMock(),
+            hook_runner=mock.MagicMock(),
+        )
+        mock_litert_lm.set_min_log_severity.assert_called_with(1000)
+    finally:
+      root_logger.setLevel(old_level)
 
   def test_litert_logging_verbose_when_debug_enabled(self):
     """Verify LiteRT log severity is VERBOSE when Python debug logging is enabled."""
@@ -680,7 +924,7 @@ class LiteRTConnectionTest(unittest.IsolatedAsyncioTestCase):
     """Verify warmup timeout scaling and engine lock wait on timeout."""
     config = litert_connection_config.LiteRTAgentConfig(
         model_path="/dummy/path.litertlm",
-        max_context_tokens=65536,
+        compaction_config=types.CompactionConfig(token_threshold=65536),
     )
     strategy = config.create_strategy(
         tool_runner=mock.MagicMock(),
@@ -706,25 +950,25 @@ class LiteRTConnectionTest(unittest.IsolatedAsyncioTestCase):
     fake_server_inst = mock.MagicMock()
     fake_server_inst.engine_lock = FakeLock()
 
-    with mock.patch.object(
-        litert_connection, "litert_lm"
-    ) as mock_lm, mock.patch.object(
-        litert_connection.litert_server,
-        "LiteRTOpenAIServer",
-        return_value=fake_server_inst,
-    ), mock.patch.object(
-        litert_connection, "_urlopen_no_proxy"
-    ) as mock_urlopen, mock.patch(
-        "os.path.exists", return_value=True
-    ), mock.patch(
-        "google.antigravity.connections.local.local_connection.LocalConnectionStrategy.__aenter__",
-        return_value=None,
+    with (
+        mock.patch.object(litert_connection, "litert_lm") as mock_lm,
+        mock.patch.object(
+            litert_connection.litert_server,
+            "LiteRTOpenAIServer",
+            return_value=fake_server_inst,
+        ),
+        mock.patch.object(
+            litert_connection, "_urlopen_no_proxy"
+        ) as mock_urlopen,
+        mock.patch("os.path.exists", return_value=True),
+        mock.patch(
+            "google.antigravity.connections.local.local_connection.LocalConnectionStrategy.__aenter__",
+            return_value=None,
+        ),
     ):
 
       def fake_urlopen(req, timeout=None):
-        url_str = str(
-            req.full_url if hasattr(req, "full_url") else str(req)
-        )
+        url_str = str(req.full_url if hasattr(req, "full_url") else str(req))
         if "chat/completions" in url_str:
           # Check scaled timeout: 65536 / 250 = 262.144
           self.assertAlmostEqual(timeout, 262.144, places=2)
@@ -778,6 +1022,331 @@ class LiteRTConnectionTest(unittest.IsolatedAsyncioTestCase):
     finally:
       if orig_attr is not None:
         setattr(local_pkg, "litert_connection", orig_attr)
+
+  def test_litert_server_handle_error_connection_reset(self):
+    """Verify handle_error suppresses reset errors and delegates others."""
+    server = litert_connection.litert_server.LiteRTOpenAIServer(
+        ("127.0.0.1", 0),
+        litert_connection.litert_server.LiteRTOpenAIHandler,
+        engine=mock.MagicMock(),
+        model_name="test-model",
+        max_output_tokens=16384,
+        thinking_token_budget=8192,
+    )
+    try:
+      with (
+          mock.patch("sys.exc_info") as mock_exc_info,
+          mock.patch.object(
+              socketserver.BaseServer, "handle_error"
+          ) as mock_super_handle_error,
+      ):
+        # 1. ConnectionResetError is suppressed
+        err = ConnectionResetError(
+            "[WinError 10054] An existing connection was forcibly closed by the"
+            " remote host"
+        )
+        mock_exc_info.return_value = (ConnectionResetError, err, None)
+        server.handle_error(mock.MagicMock(), ("127.0.0.1", 12345))
+        mock_super_handle_error.assert_not_called()
+
+        # 2. Windows OSError (winerror=10054) is suppressed
+        win_err_10054 = OSError()
+        win_err_10054.winerror = 10054
+        mock_exc_info.return_value = (OSError, win_err_10054, None)
+        server.handle_error(mock.MagicMock(), ("127.0.0.1", 12345))
+        mock_super_handle_error.assert_not_called()
+
+        # 3. Windows OSError (winerror=10053) is suppressed
+        win_err_10053 = OSError()
+        win_err_10053.winerror = 10053
+        mock_exc_info.return_value = (OSError, win_err_10053, None)
+        server.handle_error(mock.MagicMock(), ("127.0.0.1", 12345))
+        mock_super_handle_error.assert_not_called()
+
+        # 4. Unrelated error (e.g. ValueError) delegates to super().handle_error
+        val_err = ValueError("Unrelated server failure")
+        mock_exc_info.return_value = (ValueError, val_err, None)
+        req = mock.MagicMock()
+        client_addr = ("127.0.0.1", 12345)
+        server.handle_error(req, client_addr)
+        mock_super_handle_error.assert_called_once_with(req, client_addr)
+    finally:
+      server.server_close()
+
+  def test_litert_handler_handle_connection_reset(self):
+    """Verify LiteRTOpenAIHandler.handle handles reset errors and re-raises others."""
+    handler = mock.MagicMock(
+        spec=litert_connection.litert_server.LiteRTOpenAIHandler
+    )
+
+    # 1. ConnectionResetError sets close_connection = True
+    handler.close_connection = False
+    with mock.patch.object(
+        http.server.BaseHTTPRequestHandler,
+        "handle",
+        side_effect=ConnectionResetError,
+    ):
+      litert_connection.litert_server.LiteRTOpenAIHandler.handle(handler)
+      self.assertTrue(handler.close_connection)
+
+    # 2. OSError with winerror 10054 sets close_connection = True
+    handler.close_connection = False
+    win_err_10054 = OSError()
+    win_err_10054.winerror = 10054
+    with mock.patch.object(
+        http.server.BaseHTTPRequestHandler,
+        "handle",
+        side_effect=win_err_10054,
+    ):
+      litert_connection.litert_server.LiteRTOpenAIHandler.handle(handler)
+      self.assertTrue(handler.close_connection)
+
+    # 3. OSError with winerror 10053 sets close_connection = True
+    handler.close_connection = False
+    win_err_10053 = OSError()
+    win_err_10053.winerror = 10053
+    with mock.patch.object(
+        http.server.BaseHTTPRequestHandler,
+        "handle",
+        side_effect=win_err_10053,
+    ):
+      litert_connection.litert_server.LiteRTOpenAIHandler.handle(handler)
+      self.assertTrue(handler.close_connection)
+
+    # 4. Unrelated OSError (winerror=10050) is re-raised
+    handler.close_connection = False
+    win_err_other = OSError()
+    win_err_other.winerror = 10050
+    with mock.patch.object(
+        http.server.BaseHTTPRequestHandler,
+        "handle",
+        side_effect=win_err_other,
+    ):
+      with self.assertRaises(OSError):
+        litert_connection.litert_server.LiteRTOpenAIHandler.handle(handler)
+      self.assertFalse(handler.close_connection)
+
+    # 5. Non-OSError exception (e.g. ValueError) is re-raised
+    handler.close_connection = False
+    with mock.patch.object(
+        http.server.BaseHTTPRequestHandler,
+        "handle",
+        side_effect=ValueError("Unexpected"),
+    ):
+      with self.assertRaises(ValueError):
+        litert_connection.litert_server.LiteRTOpenAIHandler.handle(handler)
+      self.assertFalse(handler.close_connection)
+
+  def test_litert_server_custom_output_and_thinking_config(self):
+    """Verify LiteRTOpenAIServer stores limits and passes them to create_conversation."""
+    mock_engine = mock.MagicMock()
+    mock_conv = mock.MagicMock()
+    mock_engine.create_conversation.return_value.__enter__.return_value = (
+        mock_conv
+    )
+
+    server = litert_connection.litert_server.LiteRTOpenAIServer(
+        ("127.0.0.1", 0),
+        litert_connection.litert_server.LiteRTOpenAIHandler,
+        engine=mock_engine,
+        model_name="test-model",
+        max_output_tokens=4096,
+        thinking_token_budget=1024,
+    )
+    self.assertEqual(server.max_output_tokens, 4096)
+    self.assertEqual(server.thinking_token_budget, 1024)
+
+    handler = mock.MagicMock()
+    handler.server = server
+    handler.path = "/v1/chat/completions"
+    handler._stream_response = mock.MagicMock()
+    handler._handle_synchronous = mock.MagicMock()
+
+    with mock.patch.object(
+        litert_connection.litert_server, "litert_lm"
+    ) as mock_lm:
+      mock_lm.ThinkingConfig = mock.MagicMock(
+          return_value="mock_thinking_config"
+      )
+      mock_lm.ConstrainedDecodingConfig = mock.MagicMock(
+          return_value="mock_cdc"
+      )
+      mock_lm.Message.user = mock.MagicMock(return_value="mock_msg")
+      mock_lm.Contents.of = mock.MagicMock(return_value="mock_contents")
+
+      # 1. Request uses limits configured on server
+      payload = json.dumps(
+          {"messages": [{"role": "user", "content": "hi"}]}
+      ).encode("utf-8")
+      handler.headers = {"Content-Length": str(len(payload))}
+      handler.rfile.read.return_value = payload
+      litert_connection.litert_server.LiteRTOpenAIHandler.do_POST(handler)
+
+      mock_engine.create_conversation.assert_called_once()
+      _, kwargs = mock_engine.create_conversation.call_args
+      self.assertEqual(kwargs["max_output_tokens"], 4096)
+      mock_lm.ThinkingConfig.assert_called_with(thinking_token_budget=1024)
+      self.assertEqual(kwargs["thinking_config"], "mock_thinking_config")
+
+      # 2. Server with thinking disabled (None)
+      server.thinking_token_budget = None
+      mock_engine.create_conversation.reset_mock()
+      payload = json.dumps(
+          {"messages": [{"role": "user", "content": "hi"}]}
+      ).encode("utf-8")
+      handler.headers = {"Content-Length": str(len(payload))}
+      handler.rfile.read.return_value = payload
+      litert_connection.litert_server.LiteRTOpenAIHandler.do_POST(handler)
+
+      _, kwargs = mock_engine.create_conversation.call_args
+      self.assertEqual(kwargs["max_output_tokens"], 4096)
+      self.assertIsNone(kwargs["thinking_config"])
+
+  def test_policies_forwarded_to_strategy_and_harness_config(self):
+    """Verify explicit policies are forwarded to LiteRTConnectionStrategy."""
+    denies = [
+        policy.deny("create_file"),
+        policy.deny("edit_file"),
+        policy.deny("run_command"),
+    ]
+    config = litert_connection_config.LiteRTAgentConfig(
+        model_path="/tmp/model.litertlm",
+        policies=denies,
+    )
+    strategy = config.create_strategy(
+        tool_runner=mock.MagicMock(),
+        hook_runner=mock.MagicMock(),
+    )
+    self.assertEqual(strategy._policies, denies)
+    h_cfg = strategy._build_harness_config()
+    self.assertTrue(h_cfg.HasField("policy_config"))
+    self.assertEqual(len(h_cfg.policy_config.rules), 3)
+
+  def test_default_policies_forwarded_to_strategy(self):
+    """Verify default confirm_run_command() policy reaches strategy when policies is omitted."""
+    config = litert_connection_config.LiteRTAgentConfig(
+        model_path="/tmp/model.litertlm",
+    )
+    strategy = config.create_strategy(
+        tool_runner=mock.MagicMock(),
+        hook_runner=mock.MagicMock(),
+    )
+    self.assertEqual(len(strategy._policies), 2)
+    self.assertEqual(strategy._policies[0].tool, "run_command")
+    self.assertEqual(strategy._policies[0].decision, policy.Decision.DENY)
+    h_cfg = strategy._build_harness_config()
+    self.assertTrue(h_cfg.HasField("policy_config"))
+    self.assertEqual(len(h_cfg.policy_config.rules), 2)
+
+  def test_budget_and_session_continuation_mode_forwarded_to_strategy(self):
+    """Verify budget_config and session_continuation_mode are forwarded."""
+    budget = types.BudgetConfig(max_model_calls=5, max_total_tokens=8000)
+    config = litert_connection_config.LiteRTAgentConfig(
+        model_path="/tmp/model.litertlm",
+        conversation_id="b" * 32,
+        session_continuation_mode=types.SessionContinuationMode.RESUME,
+        budget_config=budget,
+    )
+    strategy = config.create_strategy(
+        tool_runner=mock.MagicMock(),
+        hook_runner=mock.MagicMock(),
+    )
+    self.assertEqual(
+        strategy._session_continuation_mode,
+        types.SessionContinuationMode.RESUME,
+    )
+    self.assertEqual(strategy._budget_config, budget)
+    h_cfg = strategy._build_harness_config()
+    self.assertEqual(
+        h_cfg.session_continuation_mode,
+        localharness_pb2.HarnessConfig.RESUME,
+    )
+    self.assertTrue(h_cfg.HasField("budget_config"))
+    self.assertEqual(h_cfg.budget_config.max_model_calls, 5)
+    self.assertEqual(h_cfg.budget_config.max_total_tokens, 8000)
+
+  def test_tools_forwarded_to_strategy(self):
+    """Verify custom tools are forwarded to strategy and included in harness proto."""
+    def custom_lookup(query: str) -> str:
+      """Looks up a query."""
+      return query
+
+    config = litert_connection_config.LiteRTAgentConfig(
+        model_path="/tmp/model.litertlm",
+        tools=[custom_lookup],
+    )
+    t_runner = tool_runner_mod.ToolRunner(
+        tools=config._get_all_custom_tools()
+    )
+    strategy = config.create_strategy(
+        tool_runner=t_runner,
+        hook_runner=mock.MagicMock(),
+    )
+    self.assertEqual(strategy._tools, [custom_lookup])
+    h_cfg = strategy._build_harness_config()
+    tool_names = [t.name for t in h_cfg.tools]
+    self.assertIn("custom_lookup", tool_names)
+
+
+class DeriveLiteRTCompactionConfigTest(unittest.TestCase):
+
+  def test_derive_default_tokens(self):
+    """Verify ceiling and interval derivation with standard defaults."""
+    config = litert_connection_config.derive_litert_compaction_config()
+    self.assertEqual(config.token_threshold, 40960)
+
+    config_explicit = litert_connection_config.derive_litert_compaction_config(
+        max_kv_cache_tokens=65536,
+    )
+    self.assertEqual(config_explicit.token_threshold, 40960)
+
+  def test_derive_custom_tokens(self):
+    """Verify ceiling and interval derivation with custom parameters."""
+    config = litert_connection_config.derive_litert_compaction_config(
+        max_kv_cache_tokens=32768,
+        max_output_tokens=8192,
+    )
+    self.assertEqual(config.token_threshold, 16384)
+
+  def test_derive_floor_clamp(self):
+    """Verify context ceiling is clamped to at least 1024 tokens."""
+    config = litert_connection_config.derive_litert_compaction_config(
+        max_kv_cache_tokens=10000,
+        max_output_tokens=5000,
+    )
+    self.assertEqual(config.token_threshold, 1024)
+
+    config = litert_connection_config.derive_litert_compaction_config(
+        max_kv_cache_tokens=2048,
+        max_output_tokens=2048,
+    )
+    self.assertEqual(config.token_threshold, 1024)
+
+  def test_derive_non_positive_kv_cache_tokens_raises(self):
+    """Verify ValueError is raised if max_kv_cache_tokens <= 0."""
+    with self.assertRaises(ValueError):
+      litert_connection_config.derive_litert_compaction_config(
+          max_kv_cache_tokens=0,
+          max_output_tokens=16384,
+      )
+    with self.assertRaises(ValueError):
+      litert_connection_config.derive_litert_compaction_config(
+          max_kv_cache_tokens=-1000,
+          max_output_tokens=16384,
+      )
+
+  def test_derive_non_positive_output_tokens_raises(self):
+    """Verify ValueError is raised if max_output_tokens <= 0."""
+    with self.assertRaises(ValueError):
+      litert_connection_config.derive_litert_compaction_config(
+          max_kv_cache_tokens=65536,
+          max_output_tokens=0,
+      )
+    with self.assertRaises(ValueError):
+      litert_connection_config.derive_litert_compaction_config(
+          max_kv_cache_tokens=65536,
+          max_output_tokens=-2000,
+      )
 
 
 if __name__ == "__main__":

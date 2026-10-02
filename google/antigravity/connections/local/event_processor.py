@@ -15,6 +15,7 @@
 """Event processor for localharness events."""
 
 import asyncio
+import dataclasses
 import json
 import logging
 from typing import Any, Callable, Coroutine, cast
@@ -24,11 +25,14 @@ import pydantic
 
 from google.antigravity.proto import localharness_pb2
 from google.antigravity import types
+from google.antigravity.connections.local import struct_converter
 from google.antigravity.connections.local import types as local_types
 from google.antigravity.connections.local.hook_router import HookRouter
 from google.antigravity.connections.local.local_connection_config import BUILTIN_TOOL_PROTO_FIELDS
+from google.antigravity.connections.local.local_connection_config import make_step_id
 from google.antigravity.connections.local.local_connection_config import normalize_wire_path
 from google.antigravity.connections.local.local_connection_config import WIRE_PATH_ARGUMENT_KEYS
+from google.antigravity.connections.local.proto_converters import _parse_stop_reason
 from google.antigravity.hooks import hook_runner as h_runner
 from google.antigravity.hooks import hooks
 from google.antigravity.hooks import policy as policy_lib
@@ -163,9 +167,31 @@ def _extract_tool_result(
     return None
 
 
-def _make_step_id(trajectory_id: str, step_index: int) -> str:
-  """Creates a unique step identifier."""
-  return f"{trajectory_id}:{step_index}" if trajectory_id else str(step_index)
+_make_step_id = make_step_id
+
+
+def _parse_service_tier(raw: str) -> types.ServiceTier | None:
+  """Maps a reported service tier onto the enum, tolerating unknown values.
+
+  `ServiceTier` enumerates the Gemini Developer API tiers, but the backend a
+  request actually lands on decides what it reports: Vertex AI returns tiers of
+  its own, such as `PROVISIONED_THROUGHPUT`. Usage metadata is telemetry, so an
+  unrecognised tier is dropped rather than raised -- otherwise it propagates out
+  of the websocket reader loop and kills a turn whose response already arrived.
+
+  Args:
+    raw: The service tier as reported by the backend.
+
+  Returns:
+    The matching ServiceTier, or None when the value is empty or unrecognised.
+  """
+  if not raw:
+    return None
+  try:
+    return types.ServiceTier(raw)
+  except ValueError:
+    logging.debug("Ignoring unrecognised service tier %r.", raw)
+    return None
 
 
 def parse_usage_metadata(
@@ -188,16 +214,67 @@ def parse_usage_metadata(
       total_token_count=usage_metadata.total_token_count
       if usage_metadata.HasField("total_token_count")
       else None,
-      service_tier=types.ServiceTier(usage_metadata.service_tier)
-      if usage_metadata.service_tier
-      else None,
+      service_tier=_parse_service_tier(usage_metadata.service_tier),
   )
+
+
+def _extract_tool_args(
+    tool_input: dict[str, Any] | localharness_pb2.ToolCall,
+) -> dict[str, Any]:
+  """Extracts structured tool arguments from a tool dict or ToolCall proto.
+
+  Handles:
+  1. ToolCall protobuf message with 'arguments' (proto Struct) or 'arguments_json'.
+  2. Direct 'arguments' or 'args' dict (e.g. {'query': 'val'}).
+  3. Unpacked 'arguments' dict serialized from genai.Struct (e.g. {'fields': [...]})
+     via struct_converter.unwrap_wire_struct.
+  4. Proto Struct object (via struct_converter.to_json_fallback).
+  5. Stringified 'arguments_json' (valid JSON returning a dict).
+  Falls back to an empty dict if missing or not a dict.
+  """
+  if isinstance(tool_input, localharness_pb2.ToolCall):
+    if tool_input.HasField("arguments"):
+      unpacked = struct_converter.to_json_fallback(tool_input.arguments)
+      if isinstance(unpacked, dict):
+        return unpacked
+    if tool_input.arguments_json and tool_input.arguments_json.strip():
+      try:
+        parsed = json.loads(tool_input.arguments_json)
+        if isinstance(parsed, dict):
+          return parsed
+      except json.JSONDecodeError:
+        pass
+    return {}
+
+  if not isinstance(tool_input, dict):
+    return {}
+
+  raw_args = tool_input.get("arguments")
+  if raw_args is None:
+    raw_args = tool_input.get("args")
+
+  if raw_args is not None:
+    if isinstance(raw_args, dict):
+      return struct_converter.unwrap_wire_struct(raw_args)
+    unpacked = struct_converter.to_json_fallback(raw_args)
+    if isinstance(unpacked, dict):
+      return unpacked
+
+  arguments_json = tool_input.get("arguments_json")
+  if isinstance(arguments_json, str) and arguments_json.strip():
+    try:
+      parsed = json.loads(arguments_json)
+      if isinstance(parsed, dict):
+        return parsed
+    except json.JSONDecodeError:
+      pass
+
+  return {}
 
 
 class LocalConnectionStep(types.Step):
   """Connection-specific step for LocalConnection."""
 
-  trajectory_id: str = ""
   http_code: int = 0
 
   @classmethod
@@ -211,6 +288,8 @@ class LocalConnectionStep(types.Step):
       A new LocalConnectionStep instance.
     """
     traj_id = step_dict.get("trajectory_id", "")
+    parent_traj_id = step_dict.get("parent_trajectory_id", "")
+    depth_val = step_dict.get("depth", 0)
     step_idx = step_dict.get("step_index", 0)
 
     id_str = _make_step_id(traj_id, step_idx)
@@ -236,25 +315,20 @@ class LocalConnectionStep(types.Step):
     if not active_tool_name and _MCP_TOOL_PROTO_FIELD in step_dict:
       mcp_dict = step_dict[_MCP_TOOL_PROTO_FIELD]
       if isinstance(mcp_dict, dict):
-        server_name = mcp_dict.get("server_name", "")
-        tool_name = mcp_dict.get("tool_name", "")
-        active_tool_name = tool_name
-        active_server_name = server_name
-        arguments_json = mcp_dict.get("arguments_json") or "{}"
-        active_tool_args = json.loads(arguments_json)
+        active_server_name = mcp_dict.get("server_name", "")
+        active_tool_name = mcp_dict.get("tool_name", "")
+        active_tool_args = _extract_tool_args(mcp_dict)
 
     if not active_tool_name and "custom_tool" in step_dict:
       ct_dict = step_dict["custom_tool"]
-      if isinstance(ct_dict, dict) and "tool_call" in ct_dict:
-        tc_dict = ct_dict["tool_call"]
+      if isinstance(ct_dict, dict):
+        tc_dict = (
+            ct_dict.get("tool_call") if "tool_call" in ct_dict else ct_dict
+        )
         if isinstance(tc_dict, dict):
           active_tool_name = tc_dict.get("name", "")
           active_tool_id = tc_dict.get("id")
-          arguments_json = tc_dict.get("arguments_json") or "{}"
-          try:
-            active_tool_args = json.loads(arguments_json)
-          except json.JSONDecodeError:
-            active_tool_args = {}
+          active_tool_args = _extract_tool_args(tc_dict)
 
     if active_tool_name:
       canonical_path = None
@@ -272,6 +346,7 @@ class LocalConnectionStep(types.Step):
               name=active_tool_name,
               args=active_tool_args,
               id=active_tool_id or _make_step_id(traj_id, step_idx),
+              step_id=_make_step_id(traj_id, step_idx),
               canonical_path=canonical_path,
               server_name=active_server_name,
           )
@@ -327,13 +402,23 @@ class LocalConnectionStep(types.Step):
           )
 
     error_field = step_dict.get("error", {})
-    error_msg = error_field.get("error_message", "")
-    http_code = error_field.get("http_code", 0)
+    error_msg = (
+        error_field.get("error_message", "")
+        if isinstance(error_field, dict)
+        else ""
+    ) or step_dict.get("error_message", "")
+    http_code = (
+        error_field.get("http_code", 0)
+        if isinstance(error_field, dict)
+        else 0
+    )
 
     return cls(
         id=id_str,
         step_index=step_idx,
         trajectory_id=traj_id,
+        parent_trajectory_id=parent_traj_id,
+        depth=depth_val,
         type=step_type,
         source=source,
         status=status,
@@ -350,6 +435,59 @@ class LocalConnectionStep(types.Step):
         ),
         structured_output=structured_output,
     )
+
+
+@dataclasses.dataclass
+class InitializeResult:
+  """Parsed contents of a localharness InitializeConversationResponse."""
+
+  history: list[types.Step]
+  cumulative_usage: types.UsageMetadata | None
+  trajectory_usages: dict[str, types.UsageMetadata]
+  sandbox_status: types.SandboxStatus | None
+
+
+def parse_initialize_response(
+    init_resp: localharness_pb2.InitializeConversationResponse,
+) -> InitializeResult:
+  """Parses an InitializeConversationResponse into SDK types.
+
+  Centralizes parsing of the initialization handshake -- history, cumulative and
+  per-trajectory usage, and OS sandbox status -- so all connection strategies
+  share a single implementation instead of parsing the response inline.
+  """
+  history: list[types.Step] = [
+      LocalConnectionStep.from_dict(
+          json_format.MessageToDict(
+              step_update_proto, preserving_proto_field_name=True
+          )
+      )
+      for step_update_proto in init_resp.history
+  ]
+
+  cumulative_usage = None
+  if init_resp.HasField("cumulative_usage"):
+    cumulative_usage = parse_usage_metadata(init_resp.cumulative_usage)
+
+  trajectory_usages: dict[str, types.UsageMetadata] = {}
+  for entry in init_resp.trajectory_usage:
+    if entry.trajectory_id and entry.HasField("usage"):
+      trajectory_usages[entry.trajectory_id] = parse_usage_metadata(entry.usage)
+
+  sandbox_status = None
+  if init_resp.HasField("sandbox_status"):
+    status_proto = init_resp.sandbox_status
+    sandbox_status = types.SandboxStatus(
+        available=status_proto.available,
+        unavailable_reason=status_proto.unavailable_reason or None,
+    )
+
+  return InitializeResult(
+      history=history,
+      cumulative_usage=cumulative_usage,
+      trajectory_usages=trajectory_usages,
+      sandbox_status=sandbox_status,
+  )
 
 
 class LocalHarnessEventProcessor:
@@ -395,10 +533,12 @@ class LocalHarnessEventProcessor:
         if initial_trajectory_usages is not None
         else {}
     )
+    self._turn_stop_reason: types.StopReason = types.StopReason.UNSPECIFIED
 
   def reset_for_turn(self) -> None:
     self.is_idle.clear()
     self.main_trajectory_id = None
+    self._turn_stop_reason = types.StopReason.UNSPECIFIED
     while not self.step_queue.empty():
       try:
         self.step_queue.get_nowait()
@@ -414,6 +554,11 @@ class LocalHarnessEventProcessor:
   def trajectory_usages(self) -> dict[str, types.UsageMetadata]:
     """Returns per-trajectory cumulative token usage from the backend."""
     return self._trajectory_usages.copy()
+
+  @property
+  def _last_turn_stop_reason(self) -> types.StopReason:
+    """Returns the stop reason of the most recent turn."""
+    return self._turn_stop_reason
 
   async def cancel_background_tasks(self) -> None:
     for task in self._background_tasks:
@@ -530,14 +675,6 @@ class LocalHarnessEventProcessor:
             self._get_turn_context(), step_obj
         )
 
-      # Dispatch observe-only hooks
-      if step_obj.type == types.StepType.COMPACTION and self._hook_runner:
-        self._run_in_background(
-            self._hook_runner.dispatch_compaction(
-                self._get_turn_context(), step_obj
-            )
-        )
-
       # Process wait requests if this is a wait state
       if (
           step_update.state
@@ -580,6 +717,9 @@ class LocalHarnessEventProcessor:
           logging.info("Subagent trajectory failed with error: %s", tsu.error)
         return
 
+      if tsu.stop_reason:
+        self._turn_stop_reason = _parse_stop_reason(tsu.stop_reason)
+
       if (
           tsu.state
           == localharness_pb2.TrajectoryStateUpdate.State.STATE_RUNNING
@@ -592,9 +732,7 @@ class LocalHarnessEventProcessor:
           == localharness_pb2.TrajectoryStateUpdate.State.STATE_FULLY_IDLE
       ):
         if tsu.HasField("error"):
-          await self.step_queue.put(
-              types.AntigravityExecutionError(tsu.error)
-          )
+          await self.step_queue.put(types.AntigravityExecutionError(tsu.error))
         self.is_idle.set()
         await self.step_queue.put(IDLE_SENTINEL)
 
@@ -733,13 +871,14 @@ class LocalHarnessEventProcessor:
   ) -> None:
     """Handles tool execution and hook interception."""
     try:
-      args = json.loads(tool_call.arguments_json or "{}")
-
+      args = _extract_tool_args(tool_call)
       tc = types.ToolCall(id=tool_call.id, name=tool_call.name, args=args)
+
 
       tool_call_step = LocalConnectionStep(
           id=tool_call.id,
           step_index=1,
+          trajectory_id=tool_call.trajectory_id,
           type=types.StepType.TOOL_CALL,
           source=types.StepSource.MODEL,
           target=types.StepTarget.ENVIRONMENT,
@@ -750,11 +889,8 @@ class LocalHarnessEventProcessor:
 
       if self._tool_runner:
         try:
-          results = await self._tool_runner.process_tool_calls(
-              [types.ToolCall(name=tc.name, args=tc.args)]
-          )
+          results = await self._tool_runner.process_tool_calls([tc])
           result = results[0]
-          result.id = tool_call.id
         except Exception as e:  # pylint: disable=broad-except
           result = types.ToolResult(
               id=tool_call.id,
@@ -821,28 +957,44 @@ class LocalHarnessEventProcessor:
             error_message=result.error,
         )
       else:
-        # Split any media out of the result so it reaches the model as
-        # supplemental media instead of opaque base64 in response_json.
-        cleaned_value, media = _extract_media_from_result(result.result)
-        if media and cleaned_value is None:
-          cleaned_value = f"Returned {len(media)} media attachment(s)."
-        result_for_json = (
-            result.model_copy(update={"result": cleaned_value})
-            if media
-            else result
-        )
-        response = localharness_pb2.ToolResponse(
-            id=result.id,
-            response_json=json.dumps(self.tool_result_to_dict(result_for_json)),
-            supplemental_media=[
-                localharness_pb2.Media(
-                    mime_type=item.mime_type,
-                    data=item.data,
-                    description=item.description,
-                )
-                for item in media
-            ],
-        )
+        if struct_converter.has_proto_extensions(result.result):
+          res_data = (
+              result.result
+              if struct_converter.is_structured(result.result)
+              else {"result": result.result}
+          )
+          response = localharness_pb2.ToolResponse(
+              id=result.id,
+              response=struct_converter.to_struct(res_data),
+              response_json=json.dumps(
+                  struct_converter.to_json_fallback(res_data)
+              ),
+          )
+        else:
+          # Split any media out of the result so it reaches the model as
+          # supplemental media instead of opaque base64 in response_json.
+          cleaned_value, media = _extract_media_from_result(result.result)
+          if media and cleaned_value is None:
+            cleaned_value = f"Returned {len(media)} media attachment(s)."
+          result_for_json = (
+              result.model_copy(update={"result": cleaned_value})
+              if media
+              else result
+          )
+          response = localharness_pb2.ToolResponse(
+              id=result.id,
+              response_json=json.dumps(
+                  self.tool_result_to_dict(result_for_json)
+              ),
+              supplemental_media=[
+                  localharness_pb2.Media(
+                      mime_type=item.mime_type,
+                      data=item.data,
+                      description=item.description,
+                  )
+                  for item in media
+              ],
+          )
       input_event = localharness_pb2.InputEvent(tool_response=response)
       await self._send_input_event(input_event)
 
@@ -889,27 +1041,58 @@ class LocalHarnessEventProcessor:
           return
 
       # Apply the decision.
-      if p.decision == policy_lib.Decision.ASK_USER:
-        allow = await policy_lib._execute_ask_user(p, tool_call)
+      if p.ask_user is not None:
+        reason = request.reason or p.reason
+        allow = await policy_lib._execute_ask_user(  # pylint: disable=protected-access
+            p, tool_call, reason=reason
+        )
+        deny_msg = (
+            ""
+            if allow
+            else (reason or f"Denied by user ({p.name or p.tool}).")
+        )
         await self._send_policy_decision_response(
             request.request_id,
-            outcome=localharness_pb2.POLICY_EVALUATION_OUTCOME_ALLOW
-            if allow
-            else localharness_pb2.POLICY_EVALUATION_OUTCOME_DENY,
-            deny_reason=""
-            if allow
-            else f"Denied by user ({p.name or p.tool}).",
+            outcome=(
+                localharness_pb2.POLICY_EVALUATION_OUTCOME_ALLOW
+                if allow
+                else localharness_pb2.POLICY_EVALUATION_OUTCOME_DENY
+            ),
+            deny_reason=deny_msg,
         )
-      elif p.decision == policy_lib.Decision.DENY:
+      elif p.decision == policy_lib.Decision.ASK_USER:
+        deny_msg = (
+            f"Policy '{p.name or p.tool}' requires ask_user handler, but none"
+            " was provided."
+        )
+        logging.error(deny_msg)
         await self._send_policy_decision_response(
             request.request_id,
             outcome=localharness_pb2.POLICY_EVALUATION_OUTCOME_DENY,
-            deny_reason=f"Denied by policy '{p.name or p.tool}'.",
+            deny_reason=deny_msg,
+        )
+      elif p.decision == policy_lib.Decision.DENY:
+        deny_msg = request.reason or f"Denied by policy '{p.name or p.tool}'."
+        await self._send_policy_decision_response(
+            request.request_id,
+            outcome=localharness_pb2.POLICY_EVALUATION_OUTCOME_DENY,
+            deny_reason=deny_msg,
         )
       elif p.decision == policy_lib.Decision.APPROVE:
         await self._send_policy_decision_response(
             request.request_id,
             outcome=localharness_pb2.POLICY_EVALUATION_OUTCOME_ALLOW,
+        )
+      else:
+        deny_msg = (
+            f"Unhandled policy decision '{p.decision}' for"
+            f" '{p.name or p.tool}'."
+        )
+        logging.error(deny_msg)
+        await self._send_policy_decision_response(
+            request.request_id,
+            outcome=localharness_pb2.POLICY_EVALUATION_OUTCOME_DENY,
+            deny_reason=deny_msg,
         )
     except Exception as e:  # pylint: disable=broad-except
       logging.exception("Policy evaluation failed for rule_id=%s", rule_id)

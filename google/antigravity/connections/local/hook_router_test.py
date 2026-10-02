@@ -15,6 +15,7 @@
 """Unit tests for HookRouter."""
 
 import asyncio
+import json
 from typing import Any
 from absl.testing import absltest
 from google.antigravity.proto import localharness_pb2
@@ -22,6 +23,7 @@ from google.antigravity import types
 from google.antigravity.connections.local import event_processor
 from google.antigravity.connections.local import types as local_types
 from google.antigravity.connections.local.hook_router import HookRouter
+from google.antigravity.connections.local.hook_router import make_step_id
 from google.antigravity.hooks import hook_runner as h_runner
 from google.antigravity.hooks import hooks
 
@@ -99,6 +101,104 @@ class HookRouterTest(absltest.TestCase):
       resp = sent_events[0].call_hook_response
       self.assertEqual(resp.request_id, "test_req_end")
       self.assertTrue(resp.HasField("empty_result"))
+
+    asyncio.run(_test())
+
+  def test_handle_on_compaction(self):
+
+    async def _test():
+      captured_step = []
+
+      class MyCompactionHook(hooks.OnCompactionHook):
+
+        async def run(self, context, data):
+          captured_step.append(data)
+
+      hook_runner = h_runner.HookRunner(
+          on_compaction_hooks=[MyCompactionHook()],
+      )
+
+      sent_events = []
+
+      async def mock_send(event: localharness_pb2.InputEvent):
+        sent_events.append(event)
+
+      router = HookRouter(hook_runner, mock_send)
+
+      req = localharness_pb2.CallHookRequest(
+          request_id="test_req_compaction",
+          name="OnCompaction",
+          type=localharness_pb2.LIFECYCLE_HOOK_ON_COMPACTION,
+          on_compaction_args=localharness_pb2.OnCompactionArgs(
+              trajectory_id="traj-123",
+              step_index=5,
+              summary="Custom compaction summary",
+          ),
+      )
+
+      await router.handle(req)
+
+      self.assertLen(captured_step, 1)
+      self.assertEqual(captured_step[0].id, make_step_id("traj-123", 5))
+      self.assertEqual(captured_step[0].type, types.StepType.COMPACTION)
+      self.assertEqual(captured_step[0].status, types.StepStatus.DONE)
+      self.assertEqual(captured_step[0].source, types.StepSource.SYSTEM)
+      self.assertEqual(captured_step[0].target, types.StepTarget.USER)
+      self.assertEqual(captured_step[0].content, "Custom compaction summary")
+      self.assertEqual(captured_step[0].trajectory_id, "traj-123")
+      self.assertEqual(captured_step[0].step_index, 5)
+
+      self.assertLen(sent_events, 1)
+      self.assertTrue(sent_events[0].HasField("call_hook_response"))
+      resp = sent_events[0].call_hook_response
+      self.assertEqual(resp.request_id, "test_req_compaction")
+      self.assertTrue(resp.HasField("empty_result"))
+
+    asyncio.run(_test())
+
+  def test_handle_on_compaction_default_summary(self):
+    async def _test():
+      captured_step = []
+
+      class MyDefaultCompactionHook(hooks.OnCompactionHook):
+
+        async def run(self, context, data):
+          captured_step.append(data)
+
+      hr = h_runner.HookRunner(
+          on_compaction_hooks=[MyDefaultCompactionHook()],
+      )
+
+      sent_events = []
+
+      async def mock_send(event: localharness_pb2.InputEvent):
+        sent_events.append(event)
+
+      router = HookRouter(hr, mock_send)
+
+      req = localharness_pb2.CallHookRequest(
+          request_id="test_req_comp_def",
+          name="OnCompaction",
+          type=localharness_pb2.LIFECYCLE_HOOK_ON_COMPACTION,
+          on_compaction_args=localharness_pb2.OnCompactionArgs(
+              trajectory_id="traj-def",
+              step_index=2,
+              summary="",
+          ),
+      )
+
+      await router.handle(req)
+
+      self.assertLen(captured_step, 1)
+      self.assertEqual(captured_step[0].content, "Context compaction")
+      self.assertEqual(captured_step[0].source, types.StepSource.SYSTEM)
+      self.assertEqual(captured_step[0].target, types.StepTarget.USER)
+
+      self.assertLen(sent_events, 1)
+      self.assertTrue(sent_events[0].HasField("call_hook_response"))
+      self.assertTrue(
+          sent_events[0].call_hook_response.HasField("empty_result")
+      )
 
     asyncio.run(_test())
 
@@ -259,6 +359,8 @@ class HookRouterTest(absltest.TestCase):
           post_tool_args=localharness_pb2.PostToolArgs(
               tool_name="view_file",
               result="file content here",
+              trajectory_id="traj-1",
+              step_index=5,
           ),
       )
 
@@ -269,11 +371,44 @@ class HookRouterTest(absltest.TestCase):
       tool_result = received_data[0]
       self.assertEqual(tool_result.name, "view_file")
       self.assertEqual(tool_result.result, "file content here")
+      self.assertEqual(tool_result.step_id, "traj-1:5")
       self.assertIsNone(tool_result.error)
       self.assertLen(sent_events, 1)
       resp = sent_events[0].call_hook_response
       self.assertEqual(resp.request_id, "test_post_tool")
       self.assertTrue(resp.HasField("empty_result"))
+
+    asyncio.run(_test())
+
+  def test_handle_post_tool_step_index_only(self):
+
+    async def _test():
+      fired = asyncio.Event()
+      received_data: list[Any] = []
+
+      @hooks.post_tool_call
+      async def my_hook(data: Any):
+        fired.set()
+        received_data.append(data)
+
+      hook_runner = h_runner.HookRunner(post_tool_call_hooks=[my_hook])
+      router = HookRouter(hook_runner, lambda event: asyncio.sleep(0))
+      req = localharness_pb2.CallHookRequest(
+          request_id="test_post_tool_step_only",
+          name="PostTool",
+          type=localharness_pb2.LIFECYCLE_HOOK_POST_TOOL,
+          post_tool_args=localharness_pb2.PostToolArgs(
+              tool_name="view_file",
+              result="file content here",
+              step_index=7,
+          ),
+      )
+
+      await router.handle(req)
+
+      self.assertTrue(fired.is_set())
+      self.assertLen(received_data, 1)
+      self.assertEqual(received_data[0].step_id, "7")
 
     asyncio.run(_test())
 
@@ -597,6 +732,8 @@ class HookRouterOnToolErrorTest(absltest.TestCase):
           on_tool_error_args=localharness_pb2.OnToolErrorArgs(
               tool_name="run_command",
               error_message="command failed",
+              trajectory_id="traj-1",
+              step_index=3,
           ),
       )
 
@@ -606,6 +743,7 @@ class HookRouterOnToolErrorTest(absltest.TestCase):
       self.assertLen(received_errors, 1)
       self.assertIsInstance(received_errors[0], types.ToolExecutionError)
       self.assertEqual(received_errors[0].tool_name, "run_command")
+      self.assertEqual(received_errors[0].step_id, "traj-1:3")
       self.assertIsNone(received_errors[0].server_name)
       self.assertEqual(str(received_errors[0]), "command failed")
       self.assertLen(sent_events, 1)
@@ -762,6 +900,8 @@ class HookRouterPreToolTest(absltest.TestCase):
               tool_name="run_command",
               arguments_json='{"cmd": "ls"}',
               call_id="call_pre",
+              trajectory_id="traj-1",
+              step_index=4,
           ),
       )
 
@@ -779,6 +919,110 @@ class HookRouterPreToolTest(absltest.TestCase):
       self.assertEqual(captured_tool_calls[0].name, "run_command")
       self.assertEqual(captured_tool_calls[0].args, {"cmd": "ls"})
       self.assertEqual(captured_tool_calls[0].id, "call_pre")
+      self.assertEqual(captured_tool_calls[0].step_id, "traj-1:4")
+
+    asyncio.run(_test())
+
+  def test_handle_pre_tool_modified_args(self):
+
+    async def _test():
+
+      @hooks.pre_tool_call_decide
+      async def modifying_hook(data):
+        del data
+        return hooks.HookResult(
+            allow=True, modified_args={"cmd": "echo 'sanitized'"}
+        )
+
+      hook_runner = h_runner.HookRunner(
+          pre_tool_call_decide_hooks=[modifying_hook],
+      )
+
+      sent_events = []
+
+      async def mock_send(event: localharness_pb2.InputEvent):
+        sent_events.append(event)
+
+      router = HookRouter(hook_runner, mock_send)
+
+      req = localharness_pb2.CallHookRequest(
+          request_id="test_pre_modify",
+          name="PreTool",
+          type=localharness_pb2.LIFECYCLE_HOOK_PRE_TOOL,
+          pre_tool_args=localharness_pb2.PreToolArgs(
+              tool_name="run_command",
+              arguments_json='{"cmd": "rm -rf /"}',
+              call_id="call_modify",
+          ),
+      )
+
+      await router.handle(req)
+
+      self.assertLen(sent_events, 1)
+      resp = sent_events[0].call_hook_response
+      self.assertEqual(resp.request_id, "test_pre_modify")
+      self.assertTrue(resp.HasField("pre_tool_result"))
+      self.assertTrue(resp.pre_tool_result.HasField("modified_args"))
+      self.assertEqual(resp.pre_tool_result.modified_args.fields[0].name, "cmd")
+      self.assertEqual(
+          resp.pre_tool_result.modified_args.fields[0].value.string_value,
+          "echo 'sanitized'",
+      )
+
+    asyncio.run(_test())
+
+  def test_handle_pre_tool_modified_args_non_json_serializable(self):
+
+    async def _test():
+
+      class CustomArg:
+
+        def __str__(self):
+          return "custom_value"
+
+      @hooks.pre_tool_call_decide
+      async def modifying_hook(data):
+        del data
+        return hooks.HookResult(
+            allow=True,
+            modified_args={"custom": CustomArg(), "str_val": "hello"},
+        )
+
+      hook_runner = h_runner.HookRunner(
+          pre_tool_call_decide_hooks=[modifying_hook],
+      )
+
+      sent_events = []
+
+      async def mock_send(event: localharness_pb2.InputEvent):
+        sent_events.append(event)
+
+      router = HookRouter(hook_runner, mock_send)
+
+      req = localharness_pb2.CallHookRequest(
+          request_id="test_pre_modify_custom",
+          name="PreTool",
+          type=localharness_pb2.LIFECYCLE_HOOK_PRE_TOOL,
+          pre_tool_args=localharness_pb2.PreToolArgs(
+              tool_name="run_command",
+              arguments_json='{"cmd": "echo test"}',
+              call_id="call_custom",
+          ),
+      )
+
+      # Must handle custom/rich objects in modified_args cleanly without error.
+      await router.handle(req)
+
+      self.assertLen(sent_events, 1)
+      resp = sent_events[0].call_hook_response
+      self.assertEqual(resp.request_id, "test_pre_modify_custom")
+      self.assertTrue(resp.HasField("pre_tool_result"))
+      self.assertTrue(resp.pre_tool_result.HasField("modified_args"))
+      fields = {
+          f.name: f.value for f in resp.pre_tool_result.modified_args.fields
+      }
+      self.assertEqual(fields["custom"].string_value, "custom_value")
+      self.assertEqual(fields["str_val"].string_value, "hello")
 
     asyncio.run(_test())
 
@@ -992,6 +1236,134 @@ class HookRouterPreToolTest(absltest.TestCase):
       self.assertEqual(captured_tool_calls[0].name, "pirate_multiply")
       self.assertEqual(captured_tool_calls[0].server_name, "pirate_math")
       self.assertEqual(captured_tool_calls[0].args, {"a": 5, "b": 7})
+
+    asyncio.run(_test())
+
+
+class HookRouterStopTest(absltest.TestCase):
+  """Verifies Stop hook dispatch through the HookRouter."""
+
+  async def _dispatch_stop_request(
+      self,
+      hook: hooks.StopHook,
+      stop_args: localharness_pb2.StopArgs | None = None,
+  ) -> localharness_pb2.CallHookResponse:
+    """Helper to dispatch a CallHookRequest(LIFECYCLE_HOOK_STOP) and return the response."""
+    hook_runner = h_runner.HookRunner(stop_hooks=[hook])
+    sent_events = []
+
+    async def mock_send(event: localharness_pb2.InputEvent):
+      sent_events.append(event)
+
+    router = HookRouter(hook_runner, mock_send)
+    req = localharness_pb2.CallHookRequest(
+        request_id="test_stop_req",
+        name="Stop",
+        type=localharness_pb2.LIFECYCLE_HOOK_STOP,
+    )
+    if stop_args is not None:
+      req.stop_args.CopyFrom(stop_args)
+    await router.handle(req)
+    self.assertLen(sent_events, 1)
+    return sent_events[0].call_hook_response
+
+  def test_handle_stop_allow_stop(self):
+
+    async def _test():
+      class AllowStopHook(hooks.StopHook):
+
+        async def run(self, context, data):
+          return types.StopHookResult(
+              decision=types.StopDecision.ALLOW_STOP,
+          )
+
+      resp = await self._dispatch_stop_request(
+          AllowStopHook(),
+          stop_args=localharness_pb2.StopArgs(
+              response_text="all done",
+              trajectory_id="traj-1",
+              continuation_count=0,
+          ),
+      )
+      self.assertEqual(resp.request_id, "test_stop_req")
+      self.assertTrue(resp.HasField("stop_result"))
+      self.assertEqual(
+          resp.stop_result.decision,
+          localharness_pb2.StopResult.Decision.ALLOW_STOP,
+      )
+
+    asyncio.run(_test())
+
+  def test_handle_stop_continue_unpacks_all_fields(self):
+
+    async def _test():
+      received_args = []
+
+      class ContinueStopHook(hooks.StopHook):
+
+        async def run(self, context, data):
+          received_args.append(data)
+          return types.StopHookResult(
+              decision=types.StopDecision.CONTINUE,
+              reason="Keep working on the task",
+          )
+
+      resp = await self._dispatch_stop_request(
+          ContinueStopHook(),
+          stop_args=localharness_pb2.StopArgs(
+              response_text="partial answer",
+              trajectory_id="traj-2",
+              continuation_count=1,
+              stop_reason=(
+                  localharness_pb2.TrajectoryStateUpdate.StopReason.STOP_REASON_MAX_MODEL_CALLS_EXCEEDED
+              ),
+              error_message="stopped due to error",
+          ),
+      )
+
+      self.assertLen(received_args, 1)
+      arg = received_args[0]
+      self.assertEqual(arg.response_text, "partial answer")
+      self.assertEqual(arg.trajectory_id, "traj-2")
+      self.assertEqual(arg.continuation_count, 1)
+      self.assertEqual(
+          arg.stop_reason, types.StopReason.MAX_MODEL_CALLS_EXCEEDED
+      )
+      self.assertEqual(arg.error_message, "stopped due to error")
+
+      self.assertTrue(resp.HasField("stop_result"))
+      self.assertEqual(
+          resp.stop_result.decision,
+          localharness_pb2.StopResult.Decision.CONTINUE,
+      )
+      self.assertEqual(resp.stop_result.reason, "Keep working on the task")
+
+    asyncio.run(_test())
+
+  def test_handle_stop_no_args(self):
+
+    async def _test():
+      received_args = []
+
+      class StopCheckHook(hooks.StopHook):
+
+        async def run(self, context, data):
+          received_args.append(data)
+          return types.StopHookResult()
+
+      resp = await self._dispatch_stop_request(StopCheckHook())
+      self.assertLen(received_args, 1)
+      self.assertEqual(received_args[0].response_text, "")
+      self.assertEqual(received_args[0].continuation_count, 0)
+      self.assertEqual(
+          received_args[0].stop_reason, types.StopReason.UNSPECIFIED
+      )
+
+      self.assertTrue(resp.HasField("stop_result"))
+      self.assertEqual(
+          resp.stop_result.decision,
+          localharness_pb2.StopResult.Decision.ALLOW_STOP,
+      )
 
     asyncio.run(_test())
 

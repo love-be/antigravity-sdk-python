@@ -35,15 +35,16 @@ import sys
 from absl import app
 from absl import flags
 from absl import logging
+
 from google.antigravity import Agent
 from google.antigravity import LocalAgentConfig
 from google.antigravity import types
 from google.antigravity.hooks import policy
-from google.antigravity.utils import interactive
-from google.antigravity.utils.interactive import async_input
+from google.antigravity.utils import interactive  # pyrefly: ignore[missing-module-attribute]
+from google.antigravity.utils.interactive import async_input  # pyrefly: ignore[missing-import]
 
 _MODEL_NAME = flags.DEFINE_string(
-    "model_name", "gemini-3.6-flash", "Gemini model name."
+    "model_name", "gemini-3.8-flash", "Gemini model name."
 )
 _SYSTEM_INSTRUCTION = flags.DEFINE_string(
     "system_instruction", None, "System instruction text for the agent."
@@ -73,13 +74,6 @@ def read_file_upside_down(path: str) -> str:
   with open(path, "r") as f:
     lines = f.readlines()
   return "".join(reversed(lines))
-
-
-def _add(cur: int | None, val: int | None) -> int | None:
-  """Adds two nullable ints, preserving None when both are absent."""
-  if val is None:
-    return cur
-  return (cur or 0) + val
 
 
 def _print_telemetry(
@@ -119,12 +113,14 @@ def _print_telemetry(
 
 async def run():
   """Runs the interactive CLI loop for the Google Antigravity SDK."""
-  mcp_server_path = os.path.join(
-      os.path.dirname(__file__), "..", "resources", "mcp_server.py"
+  mcp_server_path = os.path.abspath(
+      os.path.join(
+          os.path.dirname(__file__), "..", "resources", "mcp_server.py"
+      )
   )
   mcp_server = types.McpStdioServer(
       name="pirate_math",
-      command="python3",
+      command=sys.executable,
       args=[mcp_server_path, "--transport=stdio"],
   )
 
@@ -137,6 +133,7 @@ async def run():
       policies=[policy.ask_user("*", handler=interactive.ask_user_handler)],
       hooks=[interactive.AskQuestionHook()],
       capabilities=types.CapabilitiesConfig(
+          agent_behavior=types.AgentBehavior.INTERACTIVE,
           disabled_tools=disabled_tools,
       ),
       model=_MODEL_NAME.value,

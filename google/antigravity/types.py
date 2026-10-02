@@ -24,9 +24,11 @@ import asyncio
 from collections.abc import Sequence
 import enum
 import logging
+import math
 import mimetypes
 import pathlib
 from typing import Annotated, Any, AsyncIterator, Callable, ClassVar, Literal, TypeVar, cast
+import warnings
 
 import pydantic
 
@@ -56,9 +58,12 @@ __all__ = [
     "SystemInstructions",
     "SubagentConfig",
     "SubagentCapabilities",
-    "AgentMode",
+    "AgentBehavior",
     "BuiltinTools",
+    "RunCommandConfig",
     "CapabilitiesConfig",
+    "CompactionConfig",
+    "ToolOutputTruncationConfig",
     "ModelAPIRetryConfig",
     "ModelOutputRetryConfig",
     "RetryConfig",
@@ -74,6 +79,9 @@ __all__ = [
     "StepSource",
     "StepTarget",
     "StepStatus",
+    "BudgetScope",
+    "BudgetConfig",
+    "StopReason",
     "Step",
     "HookResult",
     "QuestionResponse",
@@ -97,8 +105,12 @@ __all__ = [
     "Content",
     "ContentPrimitive",
     "from_file",
+    "from_bytes",
     "SlashCommand",
     "BuiltinSlashCommandName",
+    "StopDecision",
+    "StopHookResult",
+    "StopArgs",
 ]
 
 # =============================================================================
@@ -148,8 +160,8 @@ class TemplatedSystemInstructions(pydantic.BaseModel):
 SystemInstructions = CustomSystemInstructions | TemplatedSystemInstructions
 
 
-class AgentMode(str, enum.Enum):
-  """Operational execution mode for an agent.
+class AgentBehavior(str, enum.Enum):
+  """Operational execution behavior for an agent.
 
   Attributes:
     AUTONOMOUS: Non-interactive, automated execution. The agent must accomplish
@@ -157,30 +169,85 @@ class AgentMode(str, enum.Enum):
     INTERACTIVE: The agent works collaboratively with a human, asking for
       clarifications and keeping them in the loop if needed. Enables features
       like slash commands and planning mode.
+    MINIMAL: Streamlined prompt behavior optimized for small-context and
+      on-device models by filtering system instructions down to core identity,
+      guidelines, and communication style.
   """
 
   AUTONOMOUS = "autonomous"
   INTERACTIVE = "interactive"
+  MINIMAL = "minimal"
+
+
+_MAX_INT32 = 2**31 - 1  # Maximum value for protobuf int32 wire fields
+_MAX_UINT32 = 2**32 - 1  # Maximum value for protobuf uint32 wire fields
+_MAX_INT64 = 2**63 - 1  # Maximum value for protobuf int64 wire fields
+
+
+class ToolOutputTruncationConfig(pydantic.BaseModel):
+  """Configuration for truncating large tool outputs.
+
+  When a tool's output exceeds `max_tokens`, the harness preserves the beginning
+  (prefix) of the output up to the limit and truncates the remainder (tail),
+  appending a notice informing the model that the output was truncated.
+
+  Attributes:
+    max_tokens: Maximum number of estimated tokens for a single tool response.
+      Must be non-negative. Preserves the beginning (prefix) of the tool
+      response and truncates the end (tail). Setting to 0 explicitly disables
+      truncation.
+  """
+
+  max_tokens: int = pydantic.Field(ge=0, le=_MAX_INT32)
+
+
+class RunCommandConfig(pydantic.BaseModel):
+  """Configuration for the builtin run_command tool.
+
+  Attributes:
+    enable_daemons: Whether the agent is authorized to start long-running daemon
+      commands (e.g. background dev servers, watchers) using
+      run_command(IsDaemon=True) without blocking session completion. When True,
+      the IsDaemon argument is exposed on the run_command tool schema. Defaults
+      to False.
+    timeout_seconds: Maximum execution duration in seconds for commands. When
+      None, the default timeout (10 minutes) is used. Defaults to None.
+    enable_sandbox: When True, terminal commands (run_command) are executed
+      inside the OS-level sandbox (exebox). Forwarded to the harness/cortex,
+      which enforces the sandbox at command execution time. Has no effect on
+      platforms/environments where the sandbox is unavailable. Defaults to
+      False.
+  """
+
+  enable_daemons: bool = False
+  timeout_seconds: float | None = pydantic.Field(default=None, gt=0)
+  enable_sandbox: bool = False
 
 
 class SubagentCapabilities(pydantic.BaseModel):
   """Capabilities configuration for subagents.
 
   Attributes:
-    agent_mode: Operational execution mode for the subagent. In particular,
-      AgentMode.AUTONOMOUS incentivizes the agent to solve the task on their
-      own from start to finish while AgentMode.INTERACTIVE makes the agent work
-      collaboratively with a human, asking for clarifications and keeping
-      them in the loop if needed. Defaults to AgentMode.AUTONOMOUS.
+    agent_behavior: Operational execution behavior for the subagent. In
+      particular, AgentBehavior.AUTONOMOUS incentivizes the agent to solve the
+      task on their own from start to finish, AgentBehavior.INTERACTIVE makes
+      the agent work collaboratively with a human, and AgentBehavior.MINIMAL
+      prunes prompt overhead for small-context models. Defaults to
+      AgentBehavior.AUTONOMOUS.
+    allowed_subagents: Explicit allowlist of subagent names this subagent may
+      directly invoke. When None, all registered subagents are discoverable.
     enabled_tools: Explicit allowlist of builtin tools to enable. Mutually
       exclusive with disabled_tools. When None, the harness defaults are used.
     disabled_tools: Explicit denylist of builtin tools to disable. Mutually
       exclusive with enabled_tools. When None, the harness defaults are used.
+    run_command_config: Optional configuration for the builtin run_command tool.
   """
 
-  agent_mode: AgentMode = AgentMode.AUTONOMOUS
+  agent_behavior: AgentBehavior = AgentBehavior.AUTONOMOUS
+  allowed_subagents: list[str] | None = None
   enabled_tools: list[BuiltinTools] | None = None
   disabled_tools: list[BuiltinTools] | None = None
+  run_command_config: RunCommandConfig | None = None
 
   @pydantic.model_validator(mode="after")
   def _check_mutually_exclusive(self) -> "SubagentCapabilities":
@@ -191,16 +258,32 @@ class SubagentCapabilities(pydantic.BaseModel):
     return self
 
   @pydantic.model_validator(mode="after")
+  def _validate_subagents_and_tools(self) -> "SubagentCapabilities":
+    subagent_disabled = (
+        self.disabled_tools is not None
+        and BuiltinTools.START_SUBAGENT in self.disabled_tools
+    ) or (
+        self.enabled_tools is not None
+        and BuiltinTools.START_SUBAGENT not in self.enabled_tools
+    )
+    if subagent_disabled and self.allowed_subagents is not None:
+      raise ValueError(
+          "allowed_subagents cannot be specified when START_SUBAGENT is"
+          " disabled or omitted from enabled_tools."
+      )
+    return self
+
+  @pydantic.model_validator(mode="after")
   def _validate_interactive_tools(self) -> "SubagentCapabilities":
     if (
         self.enabled_tools is not None
         and BuiltinTools.ASK_QUESTION in self.enabled_tools
-        and self.agent_mode != AgentMode.INTERACTIVE
+        and self.agent_behavior != AgentBehavior.INTERACTIVE
     ):
       logging.warning(
-          "BuiltinTools.ASK_QUESTION is enabled on subagent, but agent_mode is"
-          " not INTERACTIVE. Set"
-          " SubagentCapabilities(agent_mode=AgentMode.INTERACTIVE) if"
+          "BuiltinTools.ASK_QUESTION is enabled on subagent, but"
+          " agent_behavior is not INTERACTIVE. Set"
+          " SubagentCapabilities(agent_behavior=AgentBehavior.INTERACTIVE) if"
           " interactive question-and-answer behavior is desired."
       )
     return self
@@ -220,16 +303,21 @@ class SubagentConfig(pydantic.BaseModel):
     capabilities: Optional capabilities config controlling allowed tools. If
       None, defaults to read-only tools.
     tools: Optional list of additional custom tools (callable functions or
-      string names) to enable. Any custom Python tools used by subagents must
-      also be added to the main agent's tools list in order to be available to
-      the subagent during execution.
+      string names) to enable for this subagent.
+    model: Optional model name for this subagent. When specified, forces the
+      subagent to run under the given model instead of inheriting the parent
+      agent's model. Unlike the agent-level `model`, this accepts a name only:
+      subagents always run against the agent-level endpoint.
   """
 
   name: str
   description: str
   system_instructions: str | SystemInstructions | None = None
   capabilities: SubagentCapabilities | None = None
-  tools: list[Callable[..., Any] | str] = pydantic.Field(default_factory=list)
+  tools: list[Callable[..., Any] | str] | None = pydantic.Field(
+      default_factory=list
+  )
+  model: str | None = None
 
 
 class BuiltinTools(str, enum.Enum):
@@ -248,6 +336,7 @@ class BuiltinTools(str, enum.Enum):
     GENERATE_IMAGE: Generate or edit images.
     SEARCH_WEB: Search the web.
     READ_URL_CONTENT: Read content from a URL.
+    SCHEDULE: Schedule a one-shot timer or recurring cron job.
     FINISH: Finish the conversation and return structured output.
   """
 
@@ -263,21 +352,22 @@ class BuiltinTools(str, enum.Enum):
   GENERATE_IMAGE = "generate_image"
   SEARCH_WEB = "search_web"
   READ_URL_CONTENT = "read_url_content"
+  SCHEDULE = "schedule"
   FINISH = "finish"
 
   @classmethod
   def read_only(cls) -> list["BuiltinTools"]:
     """Returns tools that only read state (no writes, deletes, or commands).
 
+    Excludes LIST_DIR, SEARCH_DIR, and FIND_FILE, which are disabled by default.
+
     Returns:
-        A list of read-only BuiltinTools.
+        A list of default read-only BuiltinTools.
     """
     return [
-        cls.LIST_DIR,
-        cls.SEARCH_DIR,
-        cls.FIND_FILE,
         cls.VIEW_FILE,
         cls.READ_URL_CONTENT,
+        cls.SCHEDULE,
         cls.FINISH,
     ]
 
@@ -285,13 +375,12 @@ class BuiltinTools(str, enum.Enum):
   def nondestructive(cls) -> list["BuiltinTools"]:
     """Returns tools that cannot delete content.
 
+    Excludes LIST_DIR, SEARCH_DIR, and FIND_FILE, which are disabled by default.
+
     Returns:
-        A list of non-destructive BuiltinTools.
+        A list of default non-destructive BuiltinTools.
     """
     return [
-        cls.LIST_DIR,
-        cls.SEARCH_DIR,
-        cls.FIND_FILE,
         cls.VIEW_FILE,
         cls.CREATE_FILE,
         cls.EDIT_FILE,
@@ -300,6 +389,7 @@ class BuiltinTools(str, enum.Enum):
         cls.GENERATE_IMAGE,
         cls.SEARCH_WEB,
         cls.READ_URL_CONTENT,
+        cls.SCHEDULE,
         cls.FINISH,
     ]
 
@@ -337,6 +427,53 @@ class BuiltinTools(str, enum.Enum):
     """
     return []
 
+  @classmethod
+  def minimal(cls) -> list["BuiltinTools"]:
+    """Returns the minimal set of software engineering tools.
+
+    Includes run_command, view_file, create_file, and edit_file.
+
+    Returns:
+        A list of minimal BuiltinTools.
+    """
+    return [
+        cls.RUN_COMMAND,
+        cls.VIEW_FILE,
+        cls.CREATE_FILE,
+        cls.EDIT_FILE,
+    ]
+
+  @classmethod
+  def deprecated(cls) -> list["BuiltinTools"]:
+    """Returns deprecated/legacy builtin tools that are disabled by default.
+
+    Includes LIST_DIR, SEARCH_DIR, and FIND_FILE, which are excluded from
+    default tool collections and only enabled when explicitly requested via
+    `enabled_tools`.
+
+    Returns:
+        A list of deprecated BuiltinTools.
+    """
+    return [
+        cls.LIST_DIR,
+        cls.SEARCH_DIR,
+        cls.FIND_FILE,
+    ]
+
+  @classmethod
+  def default(cls) -> list["BuiltinTools"]:
+    """Returns the default set of builtin tools for autonomous agents.
+
+    Excludes ASK_QUESTION (because autonomous agents cannot prompt the user) as
+    well as deprecated tools (LIST_DIR, SEARCH_DIR, and FIND_FILE, which are off
+    by default).
+
+    Returns:
+        A list of default BuiltinTools.
+    """
+    excluded = {cls.ASK_QUESTION, *cls.deprecated()}
+    return [t for t in cls if t not in excluded]
+
 
 class CapabilitiesConfig(pydantic.BaseModel):
   """General agent capability configuration.
@@ -363,30 +500,72 @@ class CapabilitiesConfig(pydantic.BaseModel):
 
   Attributes:
     enable_subagents: Whether the agent can spawn and delegate to sub-agents.
-    agent_mode: Operational execution mode for the agent. In particular,
-      AgentMode.AUTONOMOUS incentivizes the agent to solve the task on their
-      own from start to finish while AgentMode.INTERACTIVE makes the agent work
-      collaboratively with a human, asking for clarifications and keeping
-      them in the loop if needed. Defaults to AgentMode.AUTONOMOUS.
+    agent_behavior: Operational execution behavior for the agent. In particular,
+      AgentBehavior.AUTONOMOUS incentivizes the agent to solve the task on their
+      own from start to finish, AgentBehavior.INTERACTIVE makes the agent work
+      collaboratively with a human, and AgentBehavior.MINIMAL prunes prompt
+      overhead for small-context models. Defaults to AgentBehavior.AUTONOMOUS.
     enabled_tools: Explicit allowlist of builtin tools to enable. Mutually
       exclusive with disabled_tools. When None, the harness defaults are used
-      (all tools enabled). Disabled tools are removed from the model's context,
-      saving tokens and preventing the model from even considering them.
+      (all tools enabled except ASK_QUESTION, SEARCH_DIR, and FIND_FILE).
+      Disabled tools are removed from the model's context, saving tokens and
+      preventing the model from even considering them.
     disabled_tools: Explicit denylist of builtin tools to disable. Mutually
-      exclusive with enabled_tools. When None, the harness defaults are used
-      (all tools enabled). Disabled tools are removed from the model's context,
-      saving tokens and preventing the model from even considering them.
-    compaction_threshold: Token count after which the context window may be
-      compacted. When None, the backend's default is used.
+      exclusive with enabled_tools. When specified, the given tools are
+      subtracted from default() (which already excludes ASK_QUESTION,
+      SEARCH_DIR, and FIND_FILE). When None, all default tools are enabled.
+      Disabled tools are removed from the model's context, saving tokens and
+      preventing the model from even considering them. Note that to enable
+      ASK_QUESTION, SEARCH_DIR, or FIND_FILE, they must be explicitly included
+      in enabled_tools.
+    compaction_threshold: (Deprecated) Configure
+      CompactionConfig(token_threshold=...) directly on AgentConfig instead.
     finish_tool_schema_json: Optional JSON schema string for the finish tool.
+    max_subagent_depth: Global maximum subagent recursion depth for the session.
+      When None, defaults to 1 (flat single-level delegation).
+    allowed_subagents: Explicit allowlist of subagent names the root agent may
+      directly invoke. When None, all registered subagents are discoverable.
+    run_command_config: Optional configuration for the builtin run_command tool.
+    tool_output_truncation_config: Optional configuration or token limit for
+      truncating large tool outputs (preserves beginning, truncates end).
   """
 
   enable_subagents: bool = True
-  agent_mode: AgentMode = AgentMode.AUTONOMOUS
+  agent_behavior: AgentBehavior = AgentBehavior.AUTONOMOUS
   enabled_tools: list[BuiltinTools] | None = None
   disabled_tools: list[BuiltinTools] | None = None
-  compaction_threshold: int | None = None
+  compaction_threshold: int | None = pydantic.Field(
+      default=None,
+      gt=0,
+      deprecated=(
+          "CapabilitiesConfig.compaction_threshold is deprecated. Configure"
+          " CompactionConfig(token_threshold=...) directly on AgentConfig"
+          " instead."
+      ),
+  )
   finish_tool_schema_json: str | None = None
+  max_subagent_depth: int | None = pydantic.Field(default=None, ge=1)
+  allowed_subagents: list[str] | None = None
+  run_command_config: RunCommandConfig | None = None
+  tool_output_truncation_config: ToolOutputTruncationConfig | None = None
+
+  @pydantic.field_validator("tool_output_truncation_config", mode="before")
+  @classmethod
+  def _validate_tool_output_truncation_config(
+      cls, v: Any
+  ) -> ToolOutputTruncationConfig | None:
+    if v is None:
+      return None
+    if isinstance(v, int) and not isinstance(v, bool):
+      return ToolOutputTruncationConfig(max_tokens=v)
+    if isinstance(v, ToolOutputTruncationConfig):
+      return v
+    if isinstance(v, dict):
+      return ToolOutputTruncationConfig.model_validate(v)
+    raise TypeError(
+        "tool_output_truncation_config must be an int or"
+        f" ToolOutputTruncationConfig, got {type(v).__name__}"
+    )
 
   @pydantic.model_validator(mode="after")
   def _check_mutually_exclusive(self) -> "CapabilitiesConfig":
@@ -397,22 +576,76 @@ class CapabilitiesConfig(pydantic.BaseModel):
     return self
 
   @pydantic.model_validator(mode="after")
+  def _validate_subagents_and_tools(self) -> "CapabilitiesConfig":
+    subagent_disabled = (
+        not self.enable_subagents
+        or (
+            self.disabled_tools is not None
+            and BuiltinTools.START_SUBAGENT in self.disabled_tools
+        )
+        or (
+            self.enabled_tools is not None
+            and BuiltinTools.START_SUBAGENT not in self.enabled_tools
+        )
+    )
+    if subagent_disabled:
+      if self.max_subagent_depth is not None:
+        raise ValueError(
+            "max_subagent_depth cannot be configured when subagents are"
+            " disabled (enable_subagents=False or START_SUBAGENT not enabled)."
+        )
+      if self.allowed_subagents is not None:
+        raise ValueError(
+            "allowed_subagents cannot be specified when subagents are disabled."
+        )
+    return self
+
+  @pydantic.model_validator(mode="after")
   def _validate_interactive_tools(self) -> "CapabilitiesConfig":
     if (
         self.enabled_tools is not None
         and BuiltinTools.ASK_QUESTION in self.enabled_tools
-        and self.agent_mode != AgentMode.INTERACTIVE
+        and self.agent_behavior != AgentBehavior.INTERACTIVE
     ):
       logging.warning(
-          "BuiltinTools.ASK_QUESTION is enabled, but agent_mode is not"
+          "BuiltinTools.ASK_QUESTION is enabled, but agent_behavior is not"
           " INTERACTIVE. Set"
-          " CapabilitiesConfig(agent_mode=AgentMode.INTERACTIVE) if interactive"
-          " question-and-answer behavior is desired."
+          " CapabilitiesConfig(agent_behavior=AgentBehavior.INTERACTIVE) if"
+          " interactive question-and-answer behavior is desired."
+      )
+    return self
+
+  def _get_explicit_compaction_threshold(self) -> int | None:
+    """Returns `compaction_threshold` if explicitly configured, bypassing its deprecated descriptor."""
+    if "compaction_threshold" not in self.model_fields_set:
+      return None
+    return self.__dict__.get("compaction_threshold")
+
+  @pydantic.model_validator(mode="after")
+  def _warn_deprecated_compaction_fields(self) -> "CapabilitiesConfig":
+    if self._get_explicit_compaction_threshold() is not None:
+      warnings.warn(
+          "CapabilitiesConfig.compaction_threshold is deprecated. Configure"
+          " CompactionConfig(token_threshold=...) directly on"
+          " AgentConfig instead.",
+          category=DeprecationWarning,
+          stacklevel=2,
       )
     return self
 
 
-_MAX_UINT32 = 2**32 - 1  # Maximum value for protobuf uint32 wire fields
+class CompactionConfig(pydantic.BaseModel):
+  """Configuration for conversation trajectory compaction and context limits.
+
+  Antigravity manages context by compacting older conversation history when
+  the active trajectory exceeds `token_threshold`.
+
+  Attributes:
+    token_threshold: Token ceiling allowed for the conversation history before
+      compaction occurs. When None, the backend's default limit is used.
+  """
+
+  token_threshold: int | None = pydantic.Field(default=None, gt=0)
 
 
 class ModelAPIRetryConfig(pydantic.BaseModel):
@@ -566,6 +799,8 @@ class ToolCall(pydantic.BaseModel):
 
   Attributes:
     id: Optional unique identifier for the call, often assigned by the backend.
+    step_id: Optional identifier correlating this call with its step in the
+      trajectory.
     name: Tool identifier. Use a BuiltinTools member for Connection-provided
       tools, or an arbitrary string for custom host-side tools.
     args: Keyword arguments for the tool, as a JSON-serializable dict.
@@ -577,6 +812,7 @@ class ToolCall(pydantic.BaseModel):
   name: BuiltinTools | str
   args: dict[str, Any] = pydantic.Field(default_factory=dict)
   id: str | None = None
+  step_id: str | None = None
   canonical_path: str | None = None
   server_name: str | None = None
 
@@ -586,6 +822,7 @@ class ToolResult(pydantic.BaseModel):
 
   Attributes:
     id: Optional identifier correlating this result with a ToolCall.id.
+    step_id: Optional step identifier correlating this result with a step.
     name: The name of the tool that was executed. A BuiltinTools member for
       Connection-provided tools, or a string for custom host-side tools.
     result: The tool's return value. Can be any JSON-serializable value.
@@ -600,6 +837,7 @@ class ToolResult(pydantic.BaseModel):
 
   name: BuiltinTools | str
   id: str | None = None
+  step_id: str | None = None
   result: Any = None
   error: str | None = None
   exception: Exception | None = pydantic.Field(default=None, exclude=True)
@@ -612,6 +850,20 @@ PythonTool = Callable[..., Any]
 # =============================================================================
 # Step types
 # =============================================================================
+
+
+class SandboxStatus(pydantic.BaseModel):
+  """OS command sandbox (exebox) status reported by the harness.
+
+  Attributes:
+    available: Whether the sandbox actually enforces isolation. When False,
+      run_command executes unsandboxed even if enable_sandbox was requested.
+    unavailable_reason: Human-readable explanation when available is False; None
+      when the sandbox is available.
+  """
+
+  available: bool
+  unavailable_reason: str | None = None
 
 
 class UsageMetadata(pydantic.BaseModel):
@@ -646,7 +898,14 @@ class UsageMetadata(pydantic.BaseModel):
   # Service tier.
   service_tier: ServiceTier | None = None
 
-  def __add__(self, other: UsageMetadata) -> UsageMetadata:
+  def __add__(self, other: Any) -> UsageMetadata:
+    """Adds token counts from another UsageMetadata or returns a copy for 0."""
+    if (
+        isinstance(other, (int, float))
+        and not isinstance(other, bool)
+        and other == 0
+    ):
+      return self.model_copy()
     if not isinstance(other, UsageMetadata):
       return NotImplemented
     if self.service_tier == other.service_tier:
@@ -656,7 +915,7 @@ class UsageMetadata(pydantic.BaseModel):
     else:
       # When combining different service tiers, default to STANDARD.
       merged_tier = ServiceTier.STANDARD
-    return UsageMetadata(
+    return self.__class__(
         prompt_token_count=(self.prompt_token_count or 0)
         + (other.prompt_token_count or 0),
         cached_content_token_count=(self.cached_content_token_count or 0)
@@ -670,10 +929,22 @@ class UsageMetadata(pydantic.BaseModel):
         service_tier=merged_tier,
     )
 
+  def __radd__(self, other: Any) -> UsageMetadata:
+    """Supports reflected addition for sum() accumulators and 0 identity."""
+    if (
+        isinstance(other, (int, float))
+        and not isinstance(other, bool)
+        and other == 0
+    ):
+      return self.model_copy()
+    if isinstance(other, UsageMetadata):
+      return self.__add__(other)
+    return NotImplemented
+
   def __sub__(self, other: UsageMetadata) -> UsageMetadata:
     if not isinstance(other, UsageMetadata):
       return NotImplemented
-    return UsageMetadata(
+    return self.__class__(
         prompt_token_count=(self.prompt_token_count or 0)
         - (other.prompt_token_count or 0),
         cached_content_token_count=(self.cached_content_token_count or 0)
@@ -684,7 +955,50 @@ class UsageMetadata(pydantic.BaseModel):
         - (other.thoughts_token_count or 0),
         total_token_count=(self.total_token_count or 0)
         - (other.total_token_count or 0),
+        service_tier=self.service_tier or other.service_tier,
     )
+
+  def __mul__(self, factor: Any) -> UsageMetadata:
+    """Scales token counts by a non-negative, finite numeric factor."""
+    if isinstance(factor, bool) or not isinstance(factor, (int, float)):
+      return NotImplemented
+    if not math.isfinite(factor) or factor < 0:
+      raise ValueError(
+          "Multiplication factor must be a finite, non-negative number, got"
+          f" {factor}"
+      )
+    return self.__class__(
+        prompt_token_count=(
+            round(self.prompt_token_count * factor)
+            if self.prompt_token_count is not None
+            else None
+        ),
+        cached_content_token_count=(
+            round(self.cached_content_token_count * factor)
+            if self.cached_content_token_count is not None
+            else None
+        ),
+        candidates_token_count=(
+            round(self.candidates_token_count * factor)
+            if self.candidates_token_count is not None
+            else None
+        ),
+        thoughts_token_count=(
+            round(self.thoughts_token_count * factor)
+            if self.thoughts_token_count is not None
+            else None
+        ),
+        total_token_count=(
+            round(self.total_token_count * factor)
+            if self.total_token_count is not None
+            else None
+        ),
+        service_tier=self.service_tier,
+    )
+
+  def __rmul__(self, factor: Any) -> UsageMetadata:
+    """Reflected scalar multiplication delegating to __mul__."""
+    return self.__mul__(factor)
 
 
 class StepType(str, enum.Enum):
@@ -742,12 +1056,93 @@ class SessionContinuationMode(str, enum.Enum):
   CREATE_ONLY = "create_only"
 
 
+class BudgetScope(str, enum.Enum):
+  """Evaluation scope for budget limits and caps.
+
+  Attributes:
+    LIFETIME: Budget is evaluated against cumulative spend from the start of the
+      session (step 0).
+    FORWARD_LOOKING: Budget is evaluated against spend starting from when the
+      budget was configured or the session was resumed.
+  """
+
+  LIFETIME = "LIFETIME"
+  FORWARD_LOOKING = "FORWARD_LOOKING"
+
+
+class BudgetConfig(pydantic.BaseModel):
+  """Configuration for session-level budget limits and caps.
+
+  Attributes:
+    max_model_calls: Maximum number of model invocations (reasoning steps /
+      generator calls) permitted within the configured scope.
+    max_tool_calls: Maximum number of tool invocations permitted within the
+      configured scope, regardless of tool source.
+    max_input_tokens: Maximum net uncached input tokens permitted within the
+      configured scope (calculated as prompt tokens minus cached content tokens
+      across model turns).
+    max_output_tokens: Maximum output tokens permitted within the configured
+      scope (candidates + thoughts).
+    max_total_tokens: Maximum total net tokens permitted within the configured
+      scope (calculated as net uncached input tokens + output tokens
+      across model turns).
+    scope: The evaluation scope for this budget configuration. Defaults to
+      BudgetScope.LIFETIME.
+  """
+
+  max_model_calls: int | None = pydantic.Field(
+      default=None, ge=1, le=_MAX_INT32
+  )
+  max_tool_calls: int | None = pydantic.Field(default=None, ge=1, le=_MAX_INT32)
+  max_input_tokens: int | None = pydantic.Field(
+      default=None, ge=1, le=_MAX_INT64
+  )
+  max_output_tokens: int | None = pydantic.Field(
+      default=None, ge=1, le=_MAX_INT64
+  )
+  max_total_tokens: int | None = pydantic.Field(
+      default=None, ge=1, le=_MAX_INT64
+  )
+  scope: BudgetScope = BudgetScope.LIFETIME
+
+
+class StopReason(str, enum.Enum):
+  """Reason why the execution turn stopped.
+
+  Attributes:
+    UNSPECIFIED: Default value; normal completion or unspecified stop reason.
+    MAX_MODEL_CALLS_EXCEEDED: Turn halted because session exceeded configured
+      max_model_calls.
+    MAX_TOOL_CALLS_EXCEEDED: Turn halted because session exceeded
+      max_tool_calls.
+    MAX_INPUT_TOKENS_EXCEEDED: Turn halted because session exceeded
+      max_input_tokens.
+    MAX_OUTPUT_TOKENS_EXCEEDED: Turn halted because session exceeded
+      max_output_tokens.
+    MAX_TOTAL_TOKENS_EXCEEDED: Turn halted because session exceeded
+      max_total_tokens.
+    QUOTA_EXHAUSTED: Turn halted because backend model API quota was exhausted.
+  """
+
+  UNSPECIFIED = "UNSPECIFIED"
+  MAX_MODEL_CALLS_EXCEEDED = "MAX_MODEL_CALLS_EXCEEDED"
+  MAX_TOOL_CALLS_EXCEEDED = "MAX_TOOL_CALLS_EXCEEDED"
+  MAX_INPUT_TOKENS_EXCEEDED = "MAX_INPUT_TOKENS_EXCEEDED"
+  MAX_OUTPUT_TOKENS_EXCEEDED = "MAX_OUTPUT_TOKENS_EXCEEDED"
+  MAX_TOTAL_TOKENS_EXCEEDED = "MAX_TOTAL_TOKENS_EXCEEDED"
+  QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"
+
+
 class Step(pydantic.BaseModel):
   """Structure representing one action in the agent trajectory.
 
   Attributes:
     id: Unique string identifier for the step.
     step_index: Integer index of the step in the trajectory.
+    trajectory_id: Unique identifier of the trajectory owning this step.
+    parent_trajectory_id: ID of the parent trajectory that spawned this step, or
+      empty string for the root agent conversation.
+    depth: Nesting depth of this step (0 for root conversation).
     type: The high-level type of the step.
     source: The source that generated the step.
     target: The target interacting with this step.
@@ -763,12 +1158,16 @@ class Step(pydantic.BaseModel):
       steps per turn may have this flag set; consumers that want only the last
       response should iterate fully.
     structured_output: The structured output extracted from the finish step.
-    usage_metadata: Token usage for this specific step's model invocation, or
-      None if this step did not involve a model call.
+    usage_metadata: (Deprecated) Token usage for this specific step's model
+      invocation. Deprecated in favor of ChatResponse.usage_metadata (turn-level
+      usage) and agent.conversation.total_usage (session cumulative usage).
   """
 
   id: str = ""
   step_index: int = 0
+  trajectory_id: str = ""
+  parent_trajectory_id: str = ""
+  depth: int = 0
   type: StepType = StepType.UNKNOWN
   source: StepSource = StepSource.UNKNOWN
   target: StepTarget = StepTarget.UNKNOWN
@@ -781,7 +1180,16 @@ class Step(pydantic.BaseModel):
   error: str = ""
   is_complete_response: bool | None = None
   structured_output: Any | None = None
-  usage_metadata: UsageMetadata | None = None
+  usage_metadata: UsageMetadata | None = pydantic.Field(
+      default=None,
+      deprecated=(
+          "Step.usage_metadata is deprecated and will be removed in a future"
+          " release. Token usage is emitted per model invocation and does not"
+          " map 1:1 to individual execution steps. Use"
+          " ChatResponse.usage_metadata for turn-level usage or"
+          " agent.conversation.total_usage for cumulative session usage."
+      ),
+  )
 
   model_config = pydantic.ConfigDict(extra="allow")
 
@@ -795,12 +1203,16 @@ class HookResult(pydantic.BaseModel):
   Attributes:
     allow: Whether execution should proceed.
     message: Optional explanation or response message.
+    modified_args: Optional dictionary of modified tool arguments to
+      shallow-merge into the existing arguments dictionary (overwriting
+      specified keys) before execution.
   """
 
   model_config = pydantic.ConfigDict(extra="ignore")
 
   allow: bool = True
   message: str = ""
+  modified_args: dict[str, Any] | None = None
 
 
 class QuestionResponse(pydantic.BaseModel):
@@ -860,6 +1272,68 @@ class AskQuestionInteractionSpec(pydantic.BaseModel):
   questions: list[AskQuestionEntry]
 
 
+class StopDecision(str, enum.Enum):
+  """Decision returned by a Stop lifecycle hook.
+
+  Attributes:
+    ALLOW_STOP: Allows the turn execution to terminate and transition to
+      STATE_FULLY_IDLE.
+    CONTINUE: Blocks termination, injects reason as a system prompt, and resumes
+      the agent execution loop.
+  """
+
+  ALLOW_STOP = "ALLOW_STOP"
+  CONTINUE = "CONTINUE"
+
+
+class StopHookResult(pydantic.BaseModel):
+  """Result returned by a Stop lifecycle hook.
+
+  Attributes:
+    decision: Whether to allow the turn to stop or continue execution.
+    reason: The prompt/feedback injected into the conversation when decision is
+      CONTINUE. Must be non-empty when CONTINUE is selected; otherwise, raises a
+      ValueError. Delivered directly to the model as a system message.
+  """
+
+  model_config = pydantic.ConfigDict(extra="ignore")
+
+  decision: StopDecision = StopDecision.ALLOW_STOP
+  reason: str = ""
+
+  @pydantic.model_validator(mode="after")
+  def _validate_continue_reason(self) -> "StopHookResult":
+    if self.decision == StopDecision.CONTINUE and (
+        not self.reason or not self.reason.strip()
+    ):
+      raise ValueError(
+          "StopHookResult with decision=CONTINUE requires a non-empty reason."
+      )
+    return self
+
+
+class StopArgs(pydantic.BaseModel):
+  """Arguments delivered to a Stop hook when the root turn reaches idle.
+
+  Attributes:
+    response_text: Most recent assistant response text in the turn.
+    trajectory_id: Unique identifier of the trajectory executing this turn.
+    continuation_count: The 0-based iteration count of Stop hook continuations
+      within the current turn cycle.
+    stop_reason: The reason why the trajectory stopped (SDK StopReason enum
+      value).
+    error_message: Error message if execution stopped due to a fatal error.
+  """
+
+  model_config = pydantic.ConfigDict(extra="ignore")
+
+  response_text: str = ""
+  trajectory_id: str = ""
+  continuation_count: int = 0
+  stop_reason: StopReason = StopReason.UNSPECIFIED
+  error_message: str = ""
+
+
 # =============================================================================
 # Error types
 # =============================================================================
@@ -895,6 +1369,7 @@ class ToolExecutionError(RuntimeError):
   tool_name: str
   server_name: str | None
   call_id: str | None
+  step_id: str | None
 
   def __init__(
       self,
@@ -902,11 +1377,13 @@ class ToolExecutionError(RuntimeError):
       tool_name: str,
       server_name: str | None = None,
       call_id: str | None = None,
+      step_id: str | None = None,
   ):
     super().__init__(message)
     self.tool_name = tool_name
     self.server_name = server_name
     self.call_id = call_id
+    self.step_id = step_id
 
 
 class AntigravityValidationError(Exception):
@@ -942,15 +1419,6 @@ class AntigravityValidationError(Exception):
       An AntigravityValidationError wrapping the Pydantic error.
     """
     return cls(message=str(exc), errors=cast(Any, exc.errors()))
-
-
-class TriggerDelivery(str, enum.Enum):
-  """Controls how trigger messages are delivered to the agent."""
-
-  SEND_IMMEDIATELY = "send_immediately"  # Send immediately (non-blocking).
-  WAIT_IDLE = "wait_idle"  # Wait until agent is idle before sending.
-  # TODO: INTERRUPT — cancel current turn, then send. Deferred due to
-  # safety implications for in-flight tool calls (requires Connection.cancel()).
 
 
 # =============================================================================
@@ -1109,6 +1577,11 @@ class ChatResponse:
   def usage_metadata(self) -> UsageMetadata | None:
     """Accumulated token usage across all model invocations in this turn."""
     return self._conversation.last_turn_usage
+
+  @property
+  def stop_reason(self) -> StopReason:
+    """The reason why the execution turn stopped."""
+    return self._conversation._last_turn_stop_reason  # pylint: disable=protected-access
 
   async def cancel(self) -> None:
     """Cancels the active execution turn and halts generation.

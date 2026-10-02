@@ -17,6 +17,7 @@
 import http.server
 import json
 import logging
+import sys
 import threading
 import time
 from typing import Any, cast
@@ -44,6 +45,22 @@ class OpenAITool(litert_lm.Tool if _LITERT_AVAILABLE else object):  # type: igno
     raise NotImplementedError("Proxy tools are not executable.")
 
 
+def _is_connection_reset_error(exc: BaseException | None) -> bool:
+  """Returns True if the exception indicates a client socket disconnect."""
+  if exc is None:
+    return False
+  if isinstance(
+      exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+  ):
+    return True
+  if isinstance(exc, OSError) and getattr(exc, "winerror", None) in (
+      10054,
+      10053,
+  ):
+    return True
+  return False
+
+
 class LiteRTOpenAIServer(http.server.ThreadingHTTPServer):
   """Thread-safe HTTP Server holding references to LiteRT Engine context."""
 
@@ -53,11 +70,25 @@ class LiteRTOpenAIServer(http.server.ThreadingHTTPServer):
       RequestHandlerClass: type[http.server.BaseHTTPRequestHandler],
       engine: Any,
       model_name: str,
+      max_output_tokens: int = 16384,
+      thinking_token_budget: int | None = 8192,
   ):
     self.engine = engine
     self.model_name = model_name
+    self.max_output_tokens = max_output_tokens
+    self.thinking_token_budget = thinking_token_budget
     self.engine_lock = threading.Lock()
     super().__init__(server_address, RequestHandlerClass)
+
+  def handle_error(
+      self, request: Any, client_address: tuple[str, int] | str
+  ) -> None:
+    """Suppress connection reset tracebacks when client disconnects early."""
+    _, exc_val, _ = sys.exc_info()
+    if _is_connection_reset_error(exc_val):
+      logging.debug("Client %s disconnected (%s)", client_address, exc_val)
+      return
+    super().handle_error(request, client_address)
 
 
 def _format_openai_tool_call(
@@ -101,6 +132,21 @@ class LiteRTOpenAIHandler(http.server.BaseHTTPRequestHandler):
   def address_string(self) -> str:
     """Bypass reverse DNS hostname resolution to prevent hangs in network-isolated sandboxes."""
     return self.client_address[0]
+
+  def handle(self) -> None:
+    """Handle HTTP requests, catching connection resets gracefully."""
+    try:
+      super().handle()
+    except (
+        ConnectionResetError,
+        ConnectionAbortedError,
+        BrokenPipeError,
+        OSError,
+    ) as e:
+      if _is_connection_reset_error(e):
+        self.close_connection = True
+      else:
+        raise
 
   # pylint: disable=invalid-name
   def do_GET(self) -> None:
@@ -241,6 +287,12 @@ class LiteRTOpenAIHandler(http.server.BaseHTTPRequestHandler):
         ):
           litert_tools.append(OpenAITool(t))
 
+    thinking_config = None
+    if server.thinking_token_budget is not None:
+      thinking_config = litert_lm.ThinkingConfig(
+          thinking_token_budget=server.thinking_token_budget
+      )
+
     # Thread-safe serialization for non-thread-safe C++ engine model inferences
     with server.engine_lock:
       try:
@@ -248,8 +300,8 @@ class LiteRTOpenAIHandler(http.server.BaseHTTPRequestHandler):
             messages=context_messages,
             tools=litert_tools or None,
             automatic_tool_calling=False,
-            max_output_tokens=16384,
-            thinking_config=litert_lm.ThinkingConfig(),
+            max_output_tokens=server.max_output_tokens,
+            thinking_config=thinking_config,
             constrained_decoding_config=litert_lm.ConstrainedDecodingConfig(),
         ) as conv:
           if stream:

@@ -21,13 +21,15 @@ from google.antigravity.connections.local.litert_connection_config import LiteRT
 from google.antigravity.connections.local.local_connection_config import LocalAgentConfig
 from google.antigravity.connections.local.local_openai_connection_config import LocalOpenAIAgentConfig
 from google.antigravity.tools.tool_context import ToolContext
-from google.antigravity.types import AgentMode
+from google.antigravity.types import AgentBehavior
 from google.antigravity.types import Audio
 from google.antigravity.types import BuiltinTools
 from google.antigravity.types import CapabilitiesConfig
+from google.antigravity.types import CompactionConfig
 from google.antigravity.types import Content
 from google.antigravity.types import CustomSystemInstructions
 from google.antigravity.types import Document
+from google.antigravity.types import from_bytes
 from google.antigravity.types import from_file
 from google.antigravity.types import GeminiAPIEndpoint
 from google.antigravity.types import GeminiModelOptions
@@ -38,11 +40,14 @@ from google.antigravity.types import ModelOutputRetryConfig
 from google.antigravity.types import ModelTarget
 from google.antigravity.types import ModelType
 from google.antigravity.types import RetryConfig
+from google.antigravity.types import SandboxStatus
+from google.antigravity.types import ServiceTier
 from google.antigravity.types import SystemInstructions
 from google.antigravity.types import SystemInstructionSection
 from google.antigravity.types import TemplatedSystemInstructions
 from google.antigravity.types import ThinkingLevel
 from google.antigravity.types import ToolExecutionError
+from google.antigravity.types import ToolOutputTruncationConfig
 from google.antigravity.types import UsageMetadata
 from google.antigravity.types import VertexEndpoint
 from google.antigravity.types import Video
@@ -55,10 +60,11 @@ __all__ = [
     "LiteRTBackend",
     "LocalOpenAIAgentConfig",
     "ToolContext",
-    "AgentMode",
+    "AgentBehavior",
     "Audio",
     "BuiltinTools",
     "CapabilitiesConfig",
+    "CompactionConfig",
     "Content",
     "CustomSystemInstructions",
     "Document",
@@ -71,13 +77,17 @@ __all__ = [
     "ModelTarget",
     "ModelType",
     "RetryConfig",
+    "SandboxStatus",
+    "ServiceTier",
     "SystemInstructions",
     "SystemInstructionSection",
     "TemplatedSystemInstructions",
     "ThinkingLevel",
+    "ToolOutputTruncationConfig",
     "UsageMetadata",
     "VertexEndpoint",
     "Video",
     "ToolExecutionError",
+    "from_bytes",
     "from_file",
 ]

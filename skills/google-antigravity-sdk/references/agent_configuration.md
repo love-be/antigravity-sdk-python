@@ -1,5 +1,5 @@
-<!-- disableFinding(LINK_RELATIVE_G3DOC) -->
-<!-- disableFinding(LINE_OVER_80) -->
+
+
 
 # Advanced Agent Configuration Guide
 
@@ -10,7 +10,7 @@ Google Antigravity SDK agents.
 
 ### Default Model
 
-Google Antigravity SDK's default model is `gemini-3.6-flash`.
+Google Antigravity SDK's default model is `gemini-3.8-flash`.
 
 ### Default Image Generation Model
 
@@ -43,41 +43,78 @@ Here are small code snippets demonstrating advanced configurations using
 from google.antigravity import Agent, LocalAgentConfig
 
 config = LocalAgentConfig(
-    model="gemini-3.6-flash",
+    model="gemini-3.8-flash",
 )
 async with Agent(config=config) as agent:
     # Use the agent
     pass
 ```
 
-### Agent Execution Mode (`agent_mode`)
+### Agent Execution Behavior (`agent_behavior`)
 
-The SDK supports two operational execution modes via `types.AgentMode`:
+The SDK supports two operational execution behaviors via `types.AgentBehavior`:
 
--   `AgentMode.AUTONOMOUS` (**default**): Non-interactive, automated execution.
+-   `AgentBehavior.AUTONOMOUS` (**default**): Non-interactive, automated execution.
     The agent is incentivized to accomplish the task on its own from start to
     finish.
--   `AgentMode.INTERACTIVE`: Collaborative execution with a human. The agent
+-   `AgentBehavior.INTERACTIVE`: Collaborative execution with a human. The agent
     asks clarifying questions (via `BuiltinTools.ASK_QUESTION`), enables
     interactive planning, and keeps the user in the loop.
 
-Configure `agent_mode` via `CapabilitiesConfig`:
+Configure `agent_behavior` via `CapabilitiesConfig`:
 
 ```python
 from google.antigravity import Agent, LocalAgentConfig, types
 
 config = LocalAgentConfig(
     capabilities=types.CapabilitiesConfig(
-        agent_mode=types.AgentMode.INTERACTIVE,
+        agent_behavior=types.AgentBehavior.INTERACTIVE,
     ),
 )
 async with Agent(config=config) as agent:
-    # Agent will operate in interactive mode, asking questions if needed
+    # Agent will operate with interactive behavior, asking questions if needed
     pass
 ```
 
 > [!NOTE]
-> `agent_mode` defaults to `AgentMode.AUTONOMOUS`. If you enable interactive tools such as `BuiltinTools.ASK_QUESTION` without setting `agent_mode=AgentMode.INTERACTIVE`, a validation warning will be logged.
+> `agent_behavior` defaults to `AgentBehavior.AUTONOMOUS`. If you enable interactive tools such as `BuiltinTools.ASK_QUESTION` without setting `agent_behavior=AgentBehavior.INTERACTIVE`, a validation warning will be logged.
+
+### Nested Subagents & Depth Controls (`max_subagent_depth`, `allowed_subagents`)
+
+The SDK supports multi-tier hierarchical subagent execution:
+
+-   `max_subagent_depth`: Configures the session-wide subagent recursion depth
+    ceiling on `CapabilitiesConfig` (root conversation is depth 0).
+-   `allowed_subagents`: An explicit allowlist of subagent names that the root
+    agent (on `CapabilitiesConfig`) or a specific subagent (on
+    `SubagentCapabilities`) is permitted to invoke.
+
+```python
+from google.antigravity import Agent, LocalAgentConfig, types
+
+# Configure a subagent that can invoke other subagents
+researcher = types.SubagentConfig(
+    name="researcher",
+    description="Research agent with subagent delegation capability",
+    capabilities=types.SubagentCapabilities(
+        enabled_tools=[
+            types.BuiltinTools.VIEW_FILE,
+            types.BuiltinTools.START_SUBAGENT,
+        ],
+        allowed_subagents=["fact_checker"],
+    ),
+)
+
+# Root agent configured with a max depth of 3
+config = LocalAgentConfig(
+    subagents=[researcher],
+    capabilities=types.CapabilitiesConfig(
+        enable_subagents=True,
+        max_subagent_depth=3,
+        allowed_subagents=["researcher"],
+    ),
+)
+```
 
 ### Gemini Enterprise Agent Platform (formerly Vertex AI) Configuration
 
@@ -87,19 +124,28 @@ AI) instead of Gemini Developer API:
 ```python
 from google.antigravity import Agent, LocalAgentConfig
 
-config = LocalAgentConfig(
+# 1. Express Mode (API Key) - authenticates against aiplatform.googleapis.com
+express_config = LocalAgentConfig(
+    vertex=True,
+    api_key="your-express-api-key",
+)
+
+# 2. Standard Mode (ADC) - regional routing with project and location
+standard_config = LocalAgentConfig(
     vertex=True,
     project="your-gcp-project",
     location="us-central1",
 )
-async with Agent(config=config) as agent:
-    # Use the agent with Gemini Enterprise Agent Platform
-    pass
+
+async with Agent(config=express_config) as agent:
+  # Use the agent with Gemini Enterprise Agent Platform
+  pass
 ```
 
-Note: Gemini Enterprise Agent Platform authentication relies on Application
-Default Credentials (ADC). Ensure you have run `gcloud auth application-default
-login` in your environment.
+Note: In Standard Mode, Gemini Enterprise Agent Platform authentication relies on
+Application Default Credentials (ADC); ensure you have run
+`gcloud auth application-default login` in your environment. In Express Mode,
+only the `api_key` and `vertex=True` are required.
 
 ### Prioritized Inference (`service_tier="priority"`)
 
@@ -206,15 +252,54 @@ For more details, see [mcp_integration.md](mcp_integration.md).
 
 ### Local Model Configuration
 
-The SDK supports running agents entirely on-device without an API key. Two
-additional config classes are available:
+The SDK supports running agents entirely on-device without an API key or cloud
+connectivity. Two config classes are available:
 
--   `LiteRTAgentConfig`: For running Gemma models locally via LiteRT-LM.
--   `LocalOpenAIAgentConfig`: For connecting to any OpenAI-compatible local
-    server (e.g., Ollama, LM Studio).
+-   `LiteRTAgentConfig`: For running local models (such as Gemma 4 26B) on-device
+    using Google's LiteRT runtime. Automatically manages the loopback inference
+    server lifecycle.
+-   `LocalOpenAIAgentConfig`: For connecting to an external OpenAI-compatible
+    local server (e.g., Ollama, LM Studio).
 
-For full setup instructions, hardware requirements, and configuration details,
-see [local_models.md](local_models.md).
+`LiteRTAgentConfig` automatically applies the lightweight preset upon
+instantiation (configuring core coding tools, pruning system instructions for
+smaller context windows, disabling subagents, and tuning context compaction).
+For `LocalOpenAIAgentConfig`, call `.lightweight()` explicitly to apply the
+same optimizations.
+
+```python
+import os
+from google.antigravity import Agent, LiteRTAgentConfig
+
+config = LiteRTAgentConfig(
+    model_path=os.path.expanduser(
+        "~/.litert-lm/models/gemma4-26b/model.litertlm"
+    ),
+)
+```
+
+For full setup instructions (including installing Gemma 4 26B via
+`litert-lm import`), hardware requirements, and configuration details, see
+[local_models.md](local_models.md).
+
+### Evaluation Configuration Preset
+
+Because the Antigravity SDK can be configured in many ways to satisfy different
+product surfaces, use `.eval()` when benchmarking or evaluating the SDK to apply
+a standardized, product-agnostic default that represents Gemini's core coding
+ability (disabling image generation and subagents, enabling daemon commands via
+`RunCommandConfig(enable_daemons=True)`, allowing autonomous tool execution, and
+applying `RetryConfig.benchmark()`):
+
+```python
+from google.antigravity import Agent, LocalAgentConfig
+
+config = LocalAgentConfig().eval()
+
+async with Agent(config) as agent:
+    response = await agent.chat("Run the test suite and fix any failing tests.")
+    print(await response.text())
+```
 
 ### Custom Environment Variables (Subprocess & Shell Isolation)
 
@@ -228,4 +313,63 @@ config = LocalAgentConfig(
     env={"PATH": "/custom/bin:" + os.environ.get("PATH", ""), "MY_CUSTOM_VAR": "foo"},
 )
 ```
+
+### `run_command` Configuration (`RunCommandConfig`)
+
+Configure the built-in `run_command` tool via `RunCommandConfig`, including
+running commands inside an OS-level sandbox with `enable_sandbox`:
+
+```python
+from google.antigravity import Agent, LocalAgentConfig, types
+from google.antigravity.hooks import policy
+
+config = LocalAgentConfig(
+    capabilities=types.CapabilitiesConfig(
+        run_command_config=types.RunCommandConfig(enable_sandbox=True),
+    ),
+    policies=[policy.allow_all()],
+)
+```
+
+For details and caveats, see
+[safety_policies.md](safety_policies.md#defense-in-depth-os-level-command-sandboxing).
+
+### Session Budget Controls & Stop Reasons
+
+You can configure session operational limits (`max_model_calls`, `max_tool_calls`) and proactive token budget controls (`max_input_tokens`, `max_output_tokens`, `max_total_tokens`) using `BudgetConfig`:
+
+```python
+from google.antigravity import Agent, LocalAgentConfig, types
+
+config = LocalAgentConfig(
+    budget_config=types.BudgetConfig(
+        max_model_calls=10,
+        max_tool_calls=20,
+        max_total_tokens=100_000,
+    ),
+)
+```
+
+For a full guide and multi-turn stop reason handling examples, see [budget_limits.md](../../examples/getting_started/budget_limits.md).
+
+### Context Compaction & Token Limits (`compaction_config`)
+
+Antigravity manages conversation context by compacting older conversation history when the active trajectory exceeds `token_threshold`.
+
+You can configure this using `CompactionConfig`:
+
+```python
+from google.antigravity import Agent, LocalAgentConfig, types
+
+config = LocalAgentConfig(
+    compaction_config=types.CompactionConfig(
+        token_threshold=50_000,
+    ),
+)
+```
+
+> [!NOTE]
+> When `compaction_config` is omitted (or fields are left unset), the backend's default threshold is used.
+
+For a full guide and code examples, see [compaction.md](../../examples/getting_started/compaction.md).
 

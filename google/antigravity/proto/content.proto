@@ -18,6 +18,7 @@ package genai;
 
 import "google/protobuf/duration.proto";
 import "google/protobuf/struct.proto";
+import "google/antigravity/proto/genai_json_annotations.proto";
 
 enum MediaResolution {
   MEDIA_RESOLUTION_UNSPECIFIED = 0;
@@ -28,6 +29,8 @@ enum MediaResolution {
 }
 message Content {
   oneof type {
+    option (gaos.parsing.subtype_source) = true;
+
     .genai.TextContent text = 10;
     .genai.ImageContent image = 11;
     .genai.AudioContent audio = 12;
@@ -39,6 +42,8 @@ message Content {
   }
 }
 message ContentList {
+  option (gaos.parsing.message_json_type) = JSON_TYPE_ARRAY;
+
   repeated .genai.Content contents = 1;
 }
 message WordInfo {
@@ -47,13 +52,20 @@ message WordInfo {
   .google.protobuf.Duration end_offset = 3;
   string speaker = 4;
 }
+message SpeechAnnotation {
+  string speaker = 1;
+  string style = 2;
+}
 message TextContent {
   message Annotation {
     oneof type {
+      option (gaos.parsing.subtype_source) = true;
+
       .genai.UrlCitation url_citation = 5;
       .genai.FileCitation file_citation = 6;
       .genai.PlaceCitation place_citation = 7;
       .genai.WordInfo word_info = 8;
+      .genai.SpeechAnnotation speech_metadata = 11;
     }
     int32 start_index = 1;
     int32 end_index = 2;
@@ -64,82 +76,120 @@ message TextContent {
 message ImageContent {
   enum MimeType {
     TYPE_UNSPECIFIED = 0;
-    TYPE_PNG = 1;
-    TYPE_JPEG = 2;
-    TYPE_WEBP = 3;
-    TYPE_HEIC = 4;
-    TYPE_HEIF = 5;
-    TYPE_GIF = 7;
-    TYPE_BMP = 8;
-    TYPE_TIFF = 9;
-    TYPE_VIDEO_FRAME_JPEG2000 = 10;
-    TYPE_VIDEO_JPEG2000 = 11;
+    TYPE_PNG = 1 [(gaos.parsing.enum_value_name) = "image/png"];
+    TYPE_JPEG = 2 [(gaos.parsing.enum_value_name) = "image/jpeg"];
+    TYPE_WEBP = 3 [(gaos.parsing.enum_value_name) = "image/webp"];
+    TYPE_HEIC = 4 [(gaos.parsing.enum_value_name) = "image/heic"];
+    TYPE_HEIF = 5 [(gaos.parsing.enum_value_name) = "image/heif"];
+    TYPE_GIF = 7 [(gaos.parsing.enum_value_name) = "image/gif"];
+    TYPE_BMP = 8 [(gaos.parsing.enum_value_name) = "image/bmp"];
+    TYPE_TIFF = 9 [(gaos.parsing.enum_value_name) = "image/tiff"];
+    TYPE_VIDEO_FRAME_JPEG2000 = 10
+        [(gaos.parsing.enum_value_name) = "video/videoframe/jpeg2000"];
+    TYPE_VIDEO_JPEG2000 = 11
+        [(gaos.parsing.enum_value_name) = "video/jpeg2000"];
   }
   oneof data_or_uri {
     bytes data = 2;
     string uri = 6;
   }
-  .genai.ImageContent.MimeType mime_type = 1;
+  .genai.ImageContent.MimeType mime_type = 1
+      [json_name = "legacy_mime_type_enum"];
+  string mime_type_string = 8;
   .genai.MediaResolution resolution = 5;
 }
 message AudioContent {
   enum MimeType {
     TYPE_UNSPECIFIED = 0;
-    TYPE_WAV = 1;
-    TYPE_MP3 = 2;
-    TYPE_AIFF = 3;
-    TYPE_AAC = 4;
-    TYPE_OGG = 5;
-    TYPE_FLAC = 6;
-    TYPE_MPEG = 7;
-    TYPE_M4A = 8;
-    TYPE_L16 = 9;
-    TYPE_S16LE = 10;
-    TYPE_OPUS = 11;
-    TYPE_ALAW = 12;
-    TYPE_MULAW = 13;
-    TYPE_VIDEO_AUDIO_S16LE = 14;
+    TYPE_WAV = 1 [(gaos.parsing.enum_value_name) = "audio/wav"];
+    TYPE_MP3 = 2 [(gaos.parsing.enum_value_name) = "audio/mp3"];
+    TYPE_AIFF = 3 [(gaos.parsing.enum_value_name) = "audio/aiff"];
+    TYPE_AAC = 4 [(gaos.parsing.enum_value_name) = "audio/aac"];
+    TYPE_OGG = 5 [(gaos.parsing.enum_value_name) = "audio/ogg"];
+    TYPE_FLAC = 6 [(gaos.parsing.enum_value_name) = "audio/flac"];
+    TYPE_MPEG = 7 [(gaos.parsing.enum_value_name) = "audio/mpeg"];
+    TYPE_M4A = 8 [(gaos.parsing.enum_value_name) = "audio/m4a"];
+    TYPE_L16 = 9 [(gaos.parsing.enum_value_name) = "audio/l16"];
+    TYPE_S16LE = 10 [(gaos.parsing.enum_value_name) = "audio/s16le"];
+    TYPE_OPUS = 11 [(gaos.parsing.enum_value_name) = "audio/opus"];
+    TYPE_ALAW = 12 [(gaos.parsing.enum_value_name) = "audio/alaw"];
+    TYPE_MULAW = 13 [(gaos.parsing.enum_value_name) = "audio/mulaw"];
+    TYPE_VIDEO_AUDIO_S16LE = 14
+        [(gaos.parsing.enum_value_name) = "video/audio/s16le"];
+    TYPE_WEBM = 15 [(gaos.parsing.enum_value_name) = "audio/webm"];
   }
   oneof data_or_uri {
     bytes data = 2;
     string uri = 5;
   }
-  .genai.AudioContent.MimeType mime_type = 1;
+  .genai.AudioContent.MimeType mime_type = 1
+      [json_name = "legacy_mime_type_enum"];
+  string mime_type_string = 11;
   int32 channels = 7;
   int32 sample_rate = 8;
 }
 message DocumentContent {
   enum MimeType {
     TYPE_UNSPECIFIED = 0;
-    TYPE_PDF = 1;
-    TYPE_CSV = 2;
+    TYPE_PDF = 1 [(gaos.parsing.enum_value_name) = "application/pdf"];
+    TYPE_CSV = 2 [(gaos.parsing.enum_value_name) = "text/csv"];
   }
   oneof data_or_uri {
     bytes data = 2;
     string uri = 5;
   }
-  .genai.DocumentContent.MimeType mime_type = 1;
+  .genai.DocumentContent.MimeType mime_type = 1
+      [json_name = "legacy_mime_type_enum"];
+  string mime_type_string = 6;
 }
 message VideoContent {
+  message StaticMediaProcessing {
+    .google.protobuf.Duration start_offset = 1;
+    .google.protobuf.Duration end_offset = 2;
+    double fps = 3;
+  }
+  message MediaProcessing {
+    oneof type {
+      option (gaos.parsing.subtype_source) = true;
+
+      .genai.VideoContent.StaticMediaProcessing static = 2;
+    }
+  }
   enum MimeType {
     TYPE_UNSPECIFIED = 0;
-    TYPE_MP4 = 1;
-    TYPE_MPEG = 2;
-    TYPE_MPG = 3;
-    TYPE_MOV = 4;
-    TYPE_AVI = 5;
-    TYPE_X_FLV = 6;
-    TYPE_WEBM = 7;
-    TYPE_WMV = 8;
-    TYPE_3GPP = 9;
-    TYPE_YT_BEYOND = 10;
+    TYPE_MP4 = 1 [(gaos.parsing.enum_value_name) = "video/mp4"];
+    TYPE_MPEG = 2 [(gaos.parsing.enum_value_name) = "video/mpeg"];
+    TYPE_MPG = 3 [(gaos.parsing.enum_value_name) = "video/mpg"];
+    TYPE_MOV = 4 [(gaos.parsing.enum_value_name) = "video/mov"];
+    TYPE_AVI = 5 [(gaos.parsing.enum_value_name) = "video/avi"];
+    TYPE_X_FLV = 6 [(gaos.parsing.enum_value_name) = "video/x-flv"];
+    TYPE_WEBM = 7 [(gaos.parsing.enum_value_name) = "video/webm"];
+    TYPE_WMV = 8 [(gaos.parsing.enum_value_name) = "video/wmv"];
+    TYPE_3GPP = 9 [(gaos.parsing.enum_value_name) = "video/3gpp"];
+    TYPE_YT_BEYOND = 10
+        [(gaos.parsing.enum_value_name) = "video/vnd.youtube.yt"];
+    TYPE_JPEG2000 = 11 [(gaos.parsing.enum_value_name) = "video/jpeg2000"];
+  }
+  enum Processing {
+    PROCESSING_UNSPECIFIED = 0;
+    STATIC = 1;
+    AGENTIC = 2;
   }
   oneof data_or_uri {
     bytes data = 2;
     string uri = 6;
   }
-  .genai.VideoContent.MimeType mime_type = 1;
+  oneof processing {
+    option (gaos.parsing.is_union) = true;
+
+    .genai.VideoContent.Processing processing_type = 17;
+    .genai.VideoContent.MediaProcessing processing_config = 18;
+  }
+  .genai.VideoContent.MimeType mime_type = 1
+      [json_name = "legacy_mime_type_enum"];
+  string mime_type_string = 8;
   .genai.MediaResolution resolution = 5;
+  string name = 16;
 }
 message UrlCitation {
   string url = 1;
@@ -165,13 +215,19 @@ message ReviewSnippet {
   string review_id = 3;
 }
 message Struct {
+  option (gaos.parsing.message_json_type) = JSON_TYPE_OBJECT;
+
   repeated .genai.Field fields = 1;
 }
 message Field {
+  option (gaos.parsing.message_json_type) = JSON_TYPE_OBJECT;
+
   string name = 1;
   .genai.Value value = 2;
 }
 message Value {
+  option (gaos.parsing.message_json_type) = JSON_TYPE_VALUE;
+
   oneof kind {
     .google.protobuf.NullValue null_value = 1;
     double number_value = 2;
@@ -180,9 +236,13 @@ message Value {
     .genai.Struct struct_value = 5;
     .genai.ListValue list_value = 6;
     .genai.Content content_value = 7;
+    .genai.Function function_value = 9
+        [(gaos.parsing.json_discriminator_value) = "function"];
   }
 }
 message ListValue {
+  option (gaos.parsing.message_json_type) = JSON_TYPE_ARRAY;
+
   repeated .genai.Value values = 1;
 }
 message GoogleSearch {
@@ -190,7 +250,6 @@ message GoogleSearch {
     SEARCH_TYPE_UNSPECIFIED = 0;
     SEARCH_TYPE_WEB_SEARCH = 1;
     SEARCH_TYPE_IMAGE_SEARCH = 2;
-    SEARCH_TYPE_ENTERPRISE_WEB_SEARCH = 3;
   }
   repeated .genai.GoogleSearch.SearchType search_types = 1;
 }
@@ -200,22 +259,30 @@ message ThoughtContent {
 }
 message ThoughtSummaryContent {
   oneof type {
+    option (gaos.parsing.subtype_source) = true;
+
     .genai.TextContent text = 1;
     .genai.ImageContent image = 2;
   }
 }
 message Turn {
   oneof content {
+    option (gaos.parsing.is_union) = true;
+
     .genai.ContentList content_list = 3;
     string content_string = 4;
   }
   string role = 1;
 }
 message TurnList {
+  option (gaos.parsing.message_json_type) = JSON_TYPE_ARRAY;
+
   repeated .genai.Turn turns = 1;
 }
 message ToolCallContent {
   oneof type {
+    option (gaos.parsing.subtype_source) = true;
+
     .genai.FunctionCallContent function_call = 2;
     .genai.CodeExecutionCallContent code_execution_call = 3;
     .genai.UrlContextCallContent url_context_call = 4;
@@ -229,6 +296,8 @@ message ToolCallContent {
 }
 message ToolResultContent {
   oneof type {
+    option (gaos.parsing.subtype_source) = true;
+
     .genai.FunctionResultContent function_result = 2;
     .genai.CodeExecutionResultContent code_execution_result = 3;
     .genai.UrlContextResultContent url_context_result = 4;
@@ -246,6 +315,9 @@ message FunctionCallContent {
 }
 message FunctionResultContent {
   oneof result {
+    option (gaos.parsing.is_union) = true;
+    option (gaos.parsing.is_required) = true;
+
     .genai.Struct struct_result = 3;
     .genai.FunctionResultSubcontentList content_list = 9;
     string string_result = 7;
@@ -297,6 +369,9 @@ message McpServerToolCallContent {
 }
 message McpServerToolResultContent {
   oneof result {
+    option (gaos.parsing.is_union) = true;
+    option (gaos.parsing.is_required) = true;
+
     .genai.Struct struct_result = 3;
     .genai.FunctionResultSubcontentList content_list = 6;
     string string_result = 4;
@@ -342,12 +417,24 @@ message GoogleMapsResultContent {
   }
   repeated .genai.GoogleMapsResultContent.GoogleMapsResult result = 1;
 }
+message Function {
+  string name = 1;
+  string description = 2;
+  .genai.Value parameters = 3;
+  .genai.Value response = 5;
+  bool defer_loading = 7;
+  string short_description = 8;
+}
 message FunctionResultSubcontent {
   oneof type {
+    option (gaos.parsing.subtype_source) = true;
+
     .genai.TextContent text = 1;
     .genai.ImageContent image = 2;
   }
 }
 message FunctionResultSubcontentList {
+  option (gaos.parsing.message_json_type) = JSON_TYPE_ARRAY;
+
   repeated .genai.FunctionResultSubcontent contents = 1;
 }

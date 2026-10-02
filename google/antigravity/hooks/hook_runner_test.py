@@ -163,6 +163,141 @@ class HookRunnerTest(unittest.IsolatedAsyncioTestCase):
     self.assertTrue(res.allow)
     self.assertEqual(call_order, ["decide"])
 
+  async def test_dispatch_pre_tool_call_modified_args(self):
+    class ModifyHook(hooks.PreToolCallDecideHook):
+
+      async def run(
+          self, context: hooks.HookContext, data: types.ToolCall
+      ) -> hooks.HookResult:
+        del context, data
+        return hooks.HookResult(allow=True, modified_args={"cmd": "echo safe"})
+
+    runner = hook_runner.HookRunner(
+        pre_tool_call_decide_hooks=[ModifyHook()],
+    )
+
+    turn_context = hooks.TurnContext(runner.session_context)
+    tool_call = types.ToolCall(name="run_command", args={"cmd": "rm -rf /"})
+
+    res, updated_tc, _ = await runner.dispatch_pre_tool_call(
+        turn_context, tool_call
+    )
+
+    self.assertTrue(res.allow)
+    self.assertEqual(res.modified_args, {"cmd": "echo safe"})
+    self.assertEqual(updated_tc.args, {"cmd": "echo safe"})
+
+  async def test_dispatch_pre_tool_call_chaining(self):
+    observed_in_hook2 = {}
+
+    class Hook1(hooks.PreToolCallDecideHook):
+
+      async def run(
+          self, context: hooks.HookContext, data: types.ToolCall
+      ) -> hooks.HookResult:
+        del context, data
+        return hooks.HookResult(allow=True, modified_args={"a": 10})
+
+    class Hook2(hooks.PreToolCallDecideHook):
+
+      async def run(
+          self, context: hooks.HookContext, data: types.ToolCall
+      ) -> hooks.HookResult:
+        del context
+        observed_in_hook2.update(data.args)
+        return hooks.HookResult(allow=True, modified_args={"b": 20})
+
+    runner = hook_runner.HookRunner(
+        pre_tool_call_decide_hooks=[Hook1(), Hook2()],
+    )
+
+    turn_context = hooks.TurnContext(runner.session_context)
+    tool_call = types.ToolCall(name="test_tool", args={"a": 1, "b": 2, "c": 3})
+
+    res, updated_tc, _ = await runner.dispatch_pre_tool_call(
+        turn_context, tool_call
+    )
+
+    self.assertTrue(res.allow)
+    # Hook2 should have seen Hook1's modified "a"
+    self.assertEqual(observed_in_hook2, {"a": 10, "b": 2, "c": 3})
+    # Final tool_call and result should have both modifications
+    self.assertEqual(res.modified_args, {"a": 10, "b": 20, "c": 3})
+    self.assertEqual(updated_tc.args, {"a": 10, "b": 20, "c": 3})
+
+  async def test_dispatch_pre_tool_call_modifying_then_allow(self):
+    observed_in_hook2 = {}
+
+    class ModifyingHook(hooks.PreToolCallDecideHook):
+
+      async def run(
+          self, context: hooks.HookContext, data: types.ToolCall
+      ) -> hooks.HookResult:
+        del context, data
+        return hooks.HookResult(allow=True, modified_args={"a": 10})
+
+    class PassiveAllowHook(hooks.PreToolCallDecideHook):
+
+      async def run(
+          self, context: hooks.HookContext, data: types.ToolCall
+      ) -> hooks.HookResult:
+        del context
+        observed_in_hook2.update(data.args)
+        return hooks.HookResult(allow=True, message="Audited by policy")
+
+    runner = hook_runner.HookRunner(
+        pre_tool_call_decide_hooks=[ModifyingHook(), PassiveAllowHook()],
+    )
+
+    turn_context = hooks.TurnContext(runner.session_context)
+    tool_call = types.ToolCall(name="test_tool", args={"a": 1, "b": 2, "c": 3})
+
+    res, updated_tc, _ = await runner.dispatch_pre_tool_call(
+        turn_context, tool_call
+    )
+
+    self.assertTrue(res.allow)
+    self.assertEqual(observed_in_hook2, {"a": 10, "b": 2, "c": 3})
+    self.assertEqual(res.message, "Audited by policy")
+    self.assertEqual(res.modified_args, {"a": 10, "b": 2, "c": 3})
+    self.assertEqual(updated_tc.args, {"a": 10, "b": 2, "c": 3})
+
+  async def test_dispatch_pre_tool_call_modifying_then_deny(self):
+    observed_in_hook2 = {}
+
+    class ModifyingHook(hooks.PreToolCallDecideHook):
+
+      async def run(
+          self, context: hooks.HookContext, data: types.ToolCall
+      ) -> hooks.HookResult:
+        del context, data
+        return hooks.HookResult(allow=True, modified_args={"cmd": "echo safe"})
+
+    class DenyingHook(hooks.PreToolCallDecideHook):
+
+      async def run(
+          self, context: hooks.HookContext, data: types.ToolCall
+      ) -> hooks.HookResult:
+        del context
+        observed_in_hook2.update(data.args)
+        return hooks.HookResult(allow=False, message="Forbidden tool")
+
+    runner = hook_runner.HookRunner(
+        pre_tool_call_decide_hooks=[ModifyingHook(), DenyingHook()],
+    )
+
+    turn_context = hooks.TurnContext(runner.session_context)
+    tool_call = types.ToolCall(name="run_command", args={"cmd": "rm -rf /"})
+
+    res, updated_tc, _ = await runner.dispatch_pre_tool_call(
+        turn_context, tool_call
+    )
+
+    self.assertFalse(res.allow)
+    self.assertEqual(observed_in_hook2, {"cmd": "echo safe"})
+    self.assertEqual(res.message, "Forbidden tool")
+    self.assertEqual(updated_tc.args, {"cmd": "echo safe"})
+
   async def test_context_scoping(self):
     runner = hook_runner.HookRunner()
     runner.session_context.set_state("session_key", "session_value")
@@ -280,6 +415,11 @@ class HookRunnerTest(unittest.IsolatedAsyncioTestCase):
       async def run(self, context: hooks.HookContext, data: Any) -> None:
         pass
 
+    class DummyStopHook(hooks.StopHook):
+
+      async def run(self, context: hooks.HookContext, data: Any) -> Any:
+        return types.StopHookResult()
+
     session_start_hook = DummyOnSessionStartHook()
     pre_turn_hook = DummyPreTurnHook()
     on_tool_error_hook = DummyOnToolErrorHook()
@@ -289,6 +429,7 @@ class HookRunnerTest(unittest.IsolatedAsyncioTestCase):
     decide_hook = DummyPreToolCallDecideHook()
     post_tool_call_hook = DummyPostToolCallHook()
     compaction_hook = DummyOnCompactionHook()
+    stop_hook = DummyStopHook()
 
     runner.register_hook(session_start_hook)
     runner.register_hook(pre_turn_hook)
@@ -299,6 +440,7 @@ class HookRunnerTest(unittest.IsolatedAsyncioTestCase):
     runner.register_hook(decide_hook)
     runner.register_hook(post_tool_call_hook)
     runner.register_hook(compaction_hook)
+    runner.register_hook(stop_hook)
 
     self.assertIn(session_start_hook, runner.on_session_start_hooks)
     self.assertIn(pre_turn_hook, runner.pre_turn_hooks)
@@ -310,9 +452,24 @@ class HookRunnerTest(unittest.IsolatedAsyncioTestCase):
 
     self.assertIn(post_tool_call_hook, runner.post_tool_call_hooks)
     self.assertIn(compaction_hook, runner.on_compaction_hooks)
+    self.assertIn(stop_hook, runner.stop_hooks)
 
     with self.assertRaises(ValueError):
       runner.register_hook("not a hook")
+
+  async def test_register_multi_hook(self):
+    runner = hook_runner.HookRunner()
+
+    class MultiHook(hooks.OnSessionStartHook, hooks.OnSessionEndHook):
+
+      async def run(self, context: hooks.HookContext, data: Any) -> None:
+        pass
+
+    my_hook = MultiHook()
+    runner.register_hook(my_hook)
+
+    self.assertIn(my_hook, runner.on_session_start_hooks)
+    self.assertIn(my_hook, runner.on_session_end_hooks)
 
   async def test_dispatch_post_turn(self):
     called = False
@@ -449,6 +606,117 @@ class HookRunnerTest(unittest.IsolatedAsyncioTestCase):
     await DummyInteractionHook().run(
         ctx, types.AskQuestionInteractionSpec(questions=[])
     )
+
+  async def _run_stop(
+      self, *stop_hooks: hooks.StopHook, args: types.StopArgs | None = None
+  ) -> types.StopHookResult:
+    """Helper to dispatch stop hooks with minimal boilerplate."""
+    runner = hook_runner.HookRunner(stop_hooks=list(stop_hooks))
+    return await runner.dispatch_stop(
+        hooks.TurnContext(runner.session_context), args or types.StopArgs()
+    )
+
+  async def test_dispatch_stop_continue(self):
+    """Verifies dispatch_stop returns CONTINUE when a hook decides so."""
+    received_context = []
+    received_data = []
+
+    class ContinueStopHook(hooks.StopHook):
+
+      async def run(self, context, data):
+        received_context.append(context)
+        received_data.append(data)
+        return types.StopHookResult(
+            decision=types.StopDecision.CONTINUE,
+            reason="Need more work",
+        )
+
+    res = await self._run_stop(
+        ContinueStopHook(),
+        args=types.StopArgs(response_text="done", continuation_count=0),
+    )
+    self.assertEqual(res.decision, types.StopDecision.CONTINUE)
+    self.assertEqual(res.reason, "Need more work")
+    self.assertEqual(len(received_context), 1)
+    self.assertIsInstance(received_context[0], hooks.TurnContext)
+    self.assertEqual(len(received_data), 1)
+    self.assertEqual(received_data[0].response_text, "done")
+    self.assertEqual(received_data[0].continuation_count, 0)
+
+  async def test_dispatch_stop_allow_stop(self):
+    """Verifies dispatch_stop defaults to ALLOW_STOP when no hooks continue."""
+
+    class AllowStopHook(hooks.StopHook):
+
+      async def run(self, context, data):
+        return types.StopHookResult(decision=types.StopDecision.ALLOW_STOP)
+
+    res = await self._run_stop(AllowStopHook())
+    self.assertEqual(res.decision, types.StopDecision.ALLOW_STOP)
+
+  async def test_dispatch_stop_no_hooks(self):
+    """Verifies dispatch_stop with no hooks returns ALLOW_STOP."""
+    res = await self._run_stop()
+    self.assertEqual(res.decision, types.StopDecision.ALLOW_STOP)
+
+  async def test_dispatch_stop_short_circuits_on_first_continue(self):
+    """Verifies dispatch_stop short-circuits on first CONTINUE with reason."""
+    call_order = []
+
+    class Hook1(hooks.StopHook):
+
+      async def run(self, context, data):
+        call_order.append("hook1")
+        return types.StopHookResult(
+            decision=types.StopDecision.CONTINUE, reason="hook1 reason"
+        )
+
+    class Hook2(hooks.StopHook):
+
+      async def run(self, context, data):
+        call_order.append("hook2")
+        return types.StopHookResult(
+            decision=types.StopDecision.CONTINUE, reason="hook2 reason"
+        )
+
+    res = await self._run_stop(Hook1(), Hook2())
+    self.assertEqual(res.decision, types.StopDecision.CONTINUE)
+    self.assertEqual(res.reason, "hook1 reason")
+    self.assertEqual(call_order, ["hook1"])
+
+  async def test_dispatch_stop_error_propagates(self):
+    """Verifies dispatch_stop propagates hook exceptions."""
+
+    class FailingStopHook(hooks.StopHook):
+
+      async def run(self, context, data):
+        raise RuntimeError("hook crashed")
+
+    with self.assertRaisesRegex(RuntimeError, "hook crashed"):
+      await self._run_stop(FailingStopHook())
+
+  async def test_dispatch_stop_nil_result_falls_through(self):
+    """Verifies dispatch_stop handles None result from hook."""
+
+    class NilResultHook(hooks.StopHook):
+
+      async def run(self, context, data):
+        return None
+
+    res = await self._run_stop(NilResultHook())
+    self.assertEqual(res.decision, types.StopDecision.ALLOW_STOP)
+
+  async def test_has_hooks_includes_stop(self):
+    runner = hook_runner.HookRunner()
+    self.assertFalse(runner.has_hooks)
+
+    class DummyStopHook(hooks.StopHook):
+
+      async def run(self, context, data):
+        return types.StopHookResult()
+
+    runner = hook_runner.HookRunner(stop_hooks=[DummyStopHook()])
+    self.assertTrue(runner.has_hooks)
 
 
 class DecoratorTest(unittest.IsolatedAsyncioTestCase):

@@ -18,6 +18,7 @@ import asyncio
 import collections
 import importlib.metadata
 import importlib.resources
+import inspect
 import json
 import logging
 import os
@@ -40,8 +41,10 @@ from google.antigravity.proto import localharness_pb2
 from google.antigravity import types
 from google.antigravity.connections import connection
 from google.antigravity.connections.local import event_processor
+from google.antigravity.connections.local import local_connection_config
 from google.antigravity.hooks import hook_runner as h_runner
 from google.antigravity.hooks import policy
+from google.antigravity.tools import schema_utils
 from google.antigravity.tools import tool_runner as t_runner
 
 LocalConnectionStep = event_processor.LocalConnectionStep
@@ -73,18 +76,21 @@ def to_proto_session_continuation_mode(
   return localharness_pb2.HarnessConfig.SESSION_CONTINUATION_MODE_UNSPECIFIED
 
 
-_AGENT_MODE_MAP = {
-    types.AgentMode.AUTONOMOUS: localharness_pb2.AGENT_MODE_AUTONOMOUS,
-    types.AgentMode.INTERACTIVE: localharness_pb2.AGENT_MODE_INTERACTIVE,
+_AGENT_BEHAVIOR_MAP = {
+    types.AgentBehavior.AUTONOMOUS: localharness_pb2.AGENT_BEHAVIOR_AUTONOMOUS,
+    types.AgentBehavior.INTERACTIVE: (
+        localharness_pb2.AGENT_BEHAVIOR_INTERACTIVE
+    ),
+    types.AgentBehavior.MINIMAL: localharness_pb2.AGENT_BEHAVIOR_MINIMAL,
 }
 
 
-def to_proto_agent_mode(
-    mode: types.AgentMode | None,
-) -> localharness_pb2.AgentMode:
-  if mode is not None and mode in _AGENT_MODE_MAP:
-    return _AGENT_MODE_MAP[mode]
-  return localharness_pb2.AGENT_MODE_AUTONOMOUS
+def to_proto_agent_behavior(
+    behavior: types.AgentBehavior | None,
+) -> localharness_pb2.AgentBehavior:
+  if behavior is not None and behavior in _AGENT_BEHAVIOR_MAP:
+    return _AGENT_BEHAVIOR_MAP[behavior]
+  return localharness_pb2.AGENT_BEHAVIOR_AUTONOMOUS
 
 
 def to_proto_model_type(
@@ -95,6 +101,29 @@ def to_proto_model_type(
   if model_type == types.ModelType.IMAGE:
     return localharness_pb2.MODEL_TYPE_IMAGE
   return localharness_pb2.MODEL_TYPE_UNSPECIFIED
+
+
+def to_proto_compaction_config(
+    compaction_config: types.CompactionConfig | None,
+    capabilities: types.CapabilitiesConfig | None,
+) -> tuple[localharness_pb2.CompactionConfig | None, int]:
+  """Converts SDK CompactionConfig and legacy capabilities to proto and legacy threshold."""
+  effective_compaction = compaction_config
+  if effective_compaction is None and capabilities is not None:
+    raw_threshold = capabilities._get_explicit_compaction_threshold()  # pylint: disable=protected-access
+    if raw_threshold is not None:
+      effective_compaction = types.CompactionConfig(
+          token_threshold=raw_threshold,
+      )
+
+  if effective_compaction is None:
+    return None, 0
+
+  proto = localharness_pb2.CompactionConfig(
+      token_threshold=effective_compaction.token_threshold or 0,
+  )
+  legacy_threshold = effective_compaction.token_threshold or 0
+  return proto, legacy_threshold
 
 
 def build_gemini_options_proto(
@@ -140,6 +169,52 @@ def build_retry_config_proto(
   return proto
 
 
+def build_budget_config_proto(
+    config: types.BudgetConfig | None,
+) -> localharness_pb2.BudgetConfig | None:
+  """Builds a BudgetConfig proto from a BudgetConfig model."""
+  if not config:
+    return None
+  data = config.model_dump(exclude_none=True)
+  has_limits = any(
+      k in data
+      for k in (
+          "max_model_calls",
+          "max_tool_calls",
+          "max_input_tokens",
+          "max_output_tokens",
+          "max_total_tokens",
+      )
+  )
+  if not has_limits:
+    return None
+  if "scope" in data:
+    scope_val = getattr(data["scope"], "value", data["scope"])
+    if isinstance(scope_val, int):
+      data["scope"] = scope_val
+    elif isinstance(scope_val, str):
+      scope_name = (
+          scope_val
+          if scope_val.startswith("BUDGET_SCOPE_")
+          else f"BUDGET_SCOPE_{scope_val}"
+      )
+      data["scope"] = (
+          localharness_pb2.BudgetConfig.BudgetScope.Value(scope_name)
+      )
+  return localharness_pb2.BudgetConfig(**data)
+
+
+def build_tool_output_truncation_proto(
+    config: types.ToolOutputTruncationConfig | None,
+) -> localharness_pb2.ToolOutputTruncation | None:
+  """Builds a ToolOutputTruncation proto from a ToolOutputTruncationConfig model."""
+  if config is None:
+    return None
+  proto = localharness_pb2.ToolOutputTruncation()
+  proto.truncate.max_tokens = config.max_tokens
+  return proto
+
+
 def build_models_proto(
     models: list[types.ModelTarget],
 ) -> list[localharness_pb2.ModelConfig]:
@@ -169,6 +244,7 @@ def build_models_proto(
           http_headers=m.endpoint.http_headers or {},
           project=m.endpoint.project or "",
           location=m.endpoint.location or "",
+          api_key=m.endpoint.api_key or "",
       )
       if m.endpoint.options and m.endpoint.options.model_dump(
           exclude_none=True
@@ -205,15 +281,32 @@ def callable_to_tool_proto(
     return localharness_pb2.Tool(
         name=getattr(fn, "__name__", ""),
         description=fn.__doc__ or "",
-        parameters_json_schema=json.dumps(fn.input_schema),
+        parameters_json_schema=json.dumps(
+            schema_utils.normalize_schema(fn.input_schema)
+        ),
     )
 
   # Use the ToolRunner's public callable to strip injectable params.
   target_fn = fn
-  if tool_runner is not None:
-    tool_name = getattr(fn, "__name__", "")
-    if tool_name in tool_runner.tools:
-      target_fn = tool_runner.get_public_callable(tool_name)
+  tool_name = getattr(fn, "__name__", None) or type(fn).__name__
+  if tool_runner is not None and tool_name in tool_runner.tools:
+    target_fn = tool_runner.get_public_callable(tool_name)
+
+  if not hasattr(target_fn, "__name__"):
+    orig_fn = target_fn
+
+    def wrapped(*args, **kwargs):
+      return orig_fn(*args, **kwargs)
+
+    wrapped.__name__ = tool_name
+    setattr(wrapped, "__doc__", getattr(orig_fn, "__doc__", None))
+    try:
+      setattr(wrapped, "__signature__", inspect.signature(orig_fn))
+    except (ValueError, TypeError):
+      setattr(
+          wrapped, "__annotations__", getattr(orig_fn, "__annotations__", {})
+      )
+    target_fn = wrapped
 
   decl = genai_types.FunctionDeclaration.from_callable_with_api_option(
       callable=target_fn,
@@ -224,11 +317,13 @@ def callable_to_tool_proto(
   elif decl.parameters_json_schema:
     parameters = decl.parameters_json_schema
   else:
-    parameters = {"type": "OBJECT"}
+    parameters = {"type": "object", "properties": {}}
   return localharness_pb2.Tool(
       name=decl.name,
       description=decl.description or "",
-      parameters_json_schema=json.dumps(parameters),
+      parameters_json_schema=json.dumps(
+          schema_utils.normalize_schema(parameters)
+      ),
   )
 
 
@@ -248,6 +343,44 @@ def _sanitize_prompt(text: str) -> str:
   return sanitized
 
 
+def _get_ws_close_code(e: websockets.ConnectionClosed) -> int | str | None:
+  """Safely retrieves the WebSocket close code across websockets library versions."""
+  rcvd = getattr(e, "rcvd", None)
+  if rcvd is not None and hasattr(rcvd, "code"):
+    return rcvd.code
+  sent = getattr(e, "sent", None)
+  if sent is not None and hasattr(sent, "code"):
+    return sent.code
+  if rcvd is None and sent is None:
+    return 1006
+  return getattr(e, "code", None)
+
+
+def warn_if_sandbox_unavailable(
+    run_command_cfg: localharness_pb2.RunCommandToolConfig,
+    sandbox_status: types.SandboxStatus | None,
+) -> None:
+  """Logs a warning when the sandbox was requested but is unavailable.
+
+  Emits a single warning when the caller opted into the OS command sandbox
+  (run_command enabled with enable_sandbox=True) but the harness reports the
+  sandbox cannot be enforced. Behavior is otherwise unchanged -- run_command
+  still executes, just unsandboxed. When the harness omits the sandbox status
+  (e.g. an older harness), sandbox_status is None and no warning is emitted.
+  """
+  requested_sandbox = run_command_cfg.enabled and run_command_cfg.enable_sandbox
+  if (
+      requested_sandbox
+      and sandbox_status is not None
+      and not sandbox_status.available
+  ):
+    logging.warning(
+        "enable_sandbox=True but the OS sandbox is unavailable in this harness"
+        " environment (%s); run_command will execute UNSANDBOXED.",
+        sandbox_status.unavailable_reason or "reason unknown",
+    )
+
+
 class LocalConnection(connection.Connection):
   """Connection to the Go-based local harness."""
 
@@ -263,6 +396,7 @@ class LocalConnection(connection.Connection):
       dynamic_policy_map: dict[str, "policy.Policy"] | None = None,
       initial_usage: types.UsageMetadata | None = None,
       initial_trajectory_usages: dict[str, types.UsageMetadata] | None = None,
+      sandbox_status: types.SandboxStatus | None = None,
   ):
     self._hook_runner = hook_runner
     self._process = process
@@ -271,6 +405,9 @@ class LocalConnection(connection.Connection):
     self._env = env
     self._debug_config = debug_config
     self.__initial_history = initial_history or []
+    # Static handshake data, so held on the connection rather than routed
+    # through the event processor like usage.
+    self._sandbox_status = sandbox_status
     self._client_cancelled = False
     self._is_receiving = False
 
@@ -326,6 +463,17 @@ class LocalConnection(connection.Connection):
     """Returns per-trajectory cumulative token usage from the backend."""
     return self._processor.trajectory_usages
 
+  @property
+  @override
+  def sandbox_status(self) -> types.SandboxStatus | None:
+    """Returns the OS command sandbox status reported at handshake, if any."""
+    return self._sandbox_status
+
+  @property
+  def _last_turn_stop_reason(self) -> types.StopReason:
+    """Returns the stop reason of the most recent turn from the backend."""
+    return self._processor._last_turn_stop_reason  # pylint: disable=protected-access
+
   async def send(self, prompt: types.Content | None, **kwargs: Any) -> None:
     """Sends a prompt to the agent.
 
@@ -337,20 +485,17 @@ class LocalConnection(connection.Connection):
     self._processor.reset_for_turn()
 
     if prompt is None:
-      event = localharness_pb2.InputEvent(user_input="")
-    elif isinstance(prompt, str):
-      event = localharness_pb2.InputEvent(user_input=prompt)
+      content_list = [""]
+    elif isinstance(prompt, collections.abc.Sequence) and not isinstance(
+        prompt, (str, bytes)
+    ):
+      content_list = prompt
     else:
-      if isinstance(prompt, collections.abc.Sequence) and not isinstance(
-          prompt, (str, bytes)
-      ):
-        content_list = prompt
-      else:
-        content_list = [prompt]
-      user_input_pb = localharness_pb2.UserInput(
-          parts=[to_proto_input_content(c) for c in content_list]
-      )
-      event = localharness_pb2.InputEvent(complex_user_input=user_input_pb)
+      content_list = [prompt]
+    user_input_pb = localharness_pb2.UserInput(
+        parts=[to_proto_input_content(c) for c in content_list]
+    )
+    event = localharness_pb2.InputEvent(user_input=user_input_pb)
 
     await self._send_input_event(event)
 
@@ -499,19 +644,20 @@ class LocalConnection(connection.Connection):
     """Reads OutputEvents from the WebSocket and delegates to processor."""
     try:
       async for raw_msg in self._ws:
-        logging.info("RAW WS MSG: %s", raw_msg)
+        logging.debug("RAW WS MSG: %s", raw_msg)
         event = localharness_pb2.OutputEvent()
         json_format.Parse(raw_msg, event)
         await self._processor.process_event(event)
     except websockets.ConnectionClosed as e:
+      close_code = _get_ws_close_code(e)
       if self._disconnecting:
         # Expected closure.
-        logging.info("WebSocket closed (code %s); normal shutdown.", e.code)
+        logging.info("WebSocket closed (code %s); normal shutdown.", close_code)
       else:
         # Unexpected closure.
         stderr_tail = "\n".join(self._stderr_lines) or "(no stderr output)"
         error_msg = (
-            f"Harness process exited unexpectedly (WS close code {e.code})."
+            f"Harness process exited unexpectedly (WS close code {close_code})."
             f"\nHarness stderr:\n{stderr_tail}"
         )
         logging.error(error_msg)
@@ -612,13 +758,20 @@ def _get_sdk_version() -> str:
     return "0.0.0-dev"
 
 
-def _get_default_binary_path_external() -> str:
+_HARNESS_PATH_ENV_VAR = "ANTIGRAVITY_HARNESS_PATH"
+
+
+def _get_default_binary_path_external(env: dict[str, str] | None) -> str:
   """Returns the default localharness binary path."""
-  # 1. Check environment variable first
-  if harness_path := os.environ.get("ANTIGRAVITY_HARNESS_PATH"):
+  # 1. Check passed value in env first.
+  if env and _HARNESS_PATH_ENV_VAR in env:
+    return env[_HARNESS_PATH_ENV_VAR]
+
+  # 2. Check variable in os.environ.
+  if harness_path := os.environ.get(_HARNESS_PATH_ENV_VAR):
     return harness_path
 
-  # 2. Try importlib.metadata (Robust wheel discovery)
+  # 3. Try importlib.metadata (Robust wheel discovery)
   # This is immune to sys.path shadowing by a local repository directory.
   try:
     dist = importlib.metadata.distribution("google-antigravity")
@@ -635,7 +788,7 @@ def _get_default_binary_path_external() -> str:
   except (importlib.metadata.PackageNotFoundError, ValueError, AttributeError):
     pass
 
-  # 3. Try importlib.resources (External Wheel fallback)
+  # 4. Try importlib.resources (External Wheel fallback)
   try:
     # Using 'google.antigravity' as the package name.
     # This assumes the binary is located at google/antigravity/bin/localharness
@@ -653,14 +806,14 @@ def _get_default_binary_path_external() -> str:
   except (ImportError, AttributeError, KeyError):
     pass
 
-  # 4. Fallback: Check if it's in the system PATH
+  # 5. Fallback: Check if it's in the system PATH
   if path := shutil.which("localharness"):
     return path
 
   raise RuntimeError(
       "Could not find default localharness binary. "
       "Please specify binary_path explicitly, set the "
-      "ANTIGRAVITY_HARNESS_PATH environment variable, or ensure it is in your "
+      f"{_HARNESS_PATH_ENV_VAR} environment variable, or ensure it is in your "
       "PATH. Note: If you are running from the root of the repository, the "
       "local source tree might shadow your pip-installed package and prevent "
       "resource discovery."
@@ -761,6 +914,7 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
       skills_paths: list[str] | None = None,
       system_instructions: str | types.SystemInstructions | None = None,
       capabilities_config: types.CapabilitiesConfig | None = None,
+      compaction_config: types.CompactionConfig | None = None,
       conversation_id: str | None = None,
       session_continuation_mode: types.SessionContinuationMode | None = None,
       save_dir: str | None = None,
@@ -771,7 +925,9 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
       subagents: list[types.SubagentConfig] | None = None,
       debug_config: connection.DebugConfig | None = None,
       retry_config: types.RetryConfig | None = None,
+      budget_config: types.BudgetConfig | None = None,
       policies: list[policy.Policy] | None = None,
+      tools: Sequence[Callable[..., Any] | str] | None = None,
   ):
     """Initializes the instance.
 
@@ -782,6 +938,7 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
       skills_paths: Optional list of paths to search for skills.
       system_instructions: Optional SystemInstructions or string shorthand.
       capabilities_config: Optional CapabilitiesConfig to configure tools.
+      compaction_config: Optional CompactionConfig to configure compaction.
       conversation_id: Optional conversation identifier.
       session_continuation_mode: Optional mode for establishing a connection.
       save_dir: Optional directory to save trajectories.
@@ -792,11 +949,14 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
       subagents: Optional list of static subagent configurations.
       debug_config: Optional debug configuration for the connection.
       retry_config: Optional retry configuration for model API and outputs.
+      budget_config: Optional session budget configuration.
       policies: Optional list of policy rules for the Go evaluator.
+      tools: Optional list of tools for the root agent.
     """
-    self._binary_path = _get_default_binary_path()
+    self._binary_path = _get_default_binary_path(env)
     self._tool_runner = tool_runner
     self._hook_runner = hook_runner
+    self._tools = tools
     self._connection: LocalConnection | None = None
     self._mcp_servers = mcp_servers or []
     self._models: list[types.ModelTarget] = models or []
@@ -804,6 +964,7 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
     self._env = env
     self._debug_config = debug_config
     self._retry_config = retry_config
+    self._budget_config = budget_config
     self._policies = policies or []
     # Maps rule_id -> Policy for dynamic rules evaluated during tool execution.
     self._dynamic_policy_map: dict[str, policy.Policy] = {}
@@ -819,12 +980,13 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
     self._capabilities_config = (
         capabilities_config or types.CapabilitiesConfig()
     )
+    self._compaction_config = compaction_config
     self._conversation_id = conversation_id
     self._session_continuation_mode = session_continuation_mode
     self._save_dir = save_dir
-    self._workspaces = [
-        event_processor.normalize_wire_path(ws) for ws in workspaces or []
-    ]
+    self._workspaces = local_connection_config.normalize_workspace_paths(
+        workspaces
+    )
     self._app_data_dir = app_data_dir
     self._subagents = subagents or []
 
@@ -843,12 +1005,7 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
             enabled_tools=types.BuiltinTools.read_only(),
             enable_subagents=False,
         )
-    all_tools = set(types.BuiltinTools)
-    if cfg.enabled_tools is not None:
-      return set(cfg.enabled_tools)
-    if cfg.disabled_tools is not None:
-      return all_tools - set(cfg.disabled_tools)
-    return all_tools
+    return connection.resolve_active_tools(cfg)
 
   def _to_system_instructions_proto(
       self,
@@ -869,14 +1026,44 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
   ) -> localharness_pb2.HarnessSideTools:
     active_tools = self._resolve_active_tools(cfg, is_subagent=is_subagent)
     subagent_enabled = False
-    if not is_subagent:
-      subagent_enabled = (
-          getattr(cfg, "enable_subagents", True)
-          and types.BuiltinTools.START_SUBAGENT in active_tools
+    max_depth = None
+    allowed_subagents = []
+
+    if cfg is not None:
+      subagent_enabled = getattr(cfg, "enable_subagents", True) and (
+          types.BuiltinTools.START_SUBAGENT in active_tools
       )
+      max_depth = getattr(cfg, "max_subagent_depth", None)
+      allowed_subagents = cfg.allowed_subagents or []
+    elif not is_subagent:
+      subagent_enabled = types.BuiltinTools.START_SUBAGENT in active_tools
+
+    subagents_proto = localharness_pb2.SubagentsConfig(
+        enabled=subagent_enabled,
+        allowed_subagents=allowed_subagents,
+    )
+    if max_depth is not None:
+      subagents_proto.max_nesting_depth = max_depth
+
+    run_cmd_cfg = None
+    if cfg is not None:
+      run_cmd_cfg = getattr(cfg, "run_command_config", None) or getattr(
+          cfg, "run_command", None
+      )
+    enable_daemon = (
+        run_cmd_cfg.enable_daemons if run_cmd_cfg is not None else False
+    )
+    timeout_ms = (
+        int(round(run_cmd_cfg.timeout_seconds * 1000))
+        if run_cmd_cfg is not None and run_cmd_cfg.timeout_seconds is not None
+        else 0
+    )
+    enable_sandbox = (
+        run_cmd_cfg.enable_sandbox if run_cmd_cfg is not None else False
+    )
 
     return localharness_pb2.HarnessSideTools(
-        subagents=localharness_pb2.SubagentsConfig(enabled=subagent_enabled),
+        subagents=subagents_proto,
         find=localharness_pb2.FindToolConfig(
             enabled=types.BuiltinTools.FIND_FILE in active_tools
         ),
@@ -884,7 +1071,19 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
             enabled=types.BuiltinTools.ASK_QUESTION in active_tools
         ),
         run_command=localharness_pb2.RunCommandToolConfig(
-            enabled=types.BuiltinTools.RUN_COMMAND in active_tools
+            enabled=types.BuiltinTools.RUN_COMMAND in active_tools,
+            enable_daemon_commands=enable_daemon,
+            max_timeout_ms=timeout_ms,
+            enable_sandbox=enable_sandbox,
+        ),
+        manage_task=localharness_pb2.ManageTaskToolConfig(
+            enabled=(
+                types.BuiltinTools.RUN_COMMAND in active_tools
+                or types.BuiltinTools.SCHEDULE in active_tools
+            )
+        ),
+        schedule=localharness_pb2.ScheduleToolConfig(
+            enabled=types.BuiltinTools.SCHEDULE in active_tools
         ),
         file_edit=localharness_pb2.FileEditToolConfig(
             enabled=types.BuiltinTools.EDIT_FILE in active_tools
@@ -914,7 +1113,7 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
 
   def _build_custom_subagents_protos(
       self,
-      main_agent_tool_protos: dict[str, localharness_pb2.Tool],
+      all_tool_protos: dict[str, localharness_pb2.Tool],
   ) -> list[localharness_pb2.CustomAgent]:
     """Resolves and builds CustomAgent configuration protos for subagents."""
     custom_agents_protos = []
@@ -923,33 +1122,29 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
           enabled_tools=types.BuiltinTools.read_only(),
       )
 
-      active_tools = self._resolve_active_tools(capabilities, is_subagent=True)
-      if types.BuiltinTools.START_SUBAGENT in active_tools:
-        logging.warning(
-            "Nested subagents are currently not supported. Subagent tools will"
-            " be disabled."
-        )
-
       resolved_subagent_tools = []
       for tool in subagent.tools or []:
         if isinstance(tool, str):
           name = tool
+          if name in all_tool_protos:
+            resolved_subagent_tools.append(all_tool_protos[name])
+          else:
+            resolved_subagent_tools.append(localharness_pb2.Tool(name=name))
+        elif callable(tool):
+          proto = callable_to_tool_proto(tool, tool_runner=self._tool_runner)
+          all_tool_protos[proto.name] = proto
+          resolved_subagent_tools.append(proto)
         else:
-          name = getattr(tool, "__name__", None)
-          if name is None:
-            raise ValueError(
-                f"Invalid tool type in subagent '{subagent.name}' tools list:"
-                f" {tool}"
-            )
-
-        if name not in main_agent_tool_protos:
           raise ValueError(
-              f"Subagent tool '{name}' is not registered on the main agent"
-              " config. Any custom tools used by subagents must also be added"
-              " to the main agent's tools list."
+              f"Invalid tool type in subagent '{subagent.name}' tools list:"
+              f" {tool}"
           )
 
-        resolved_subagent_tools.append(main_agent_tool_protos[name])
+      model_proto = None
+      if subagent.model is not None:
+        # Subagents pin a model name only; they always run against the
+        # agent-level endpoint. See localharness/subagent.go.
+        model_proto = localharness_pb2.ModelConfig(name=subagent.model)
 
       custom_agents_protos.append(
           localharness_pb2.CustomAgent(
@@ -962,18 +1157,52 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
                   capabilities, is_subagent=True
               ),
               tools=resolved_subagent_tools,
-              agent_mode=to_proto_agent_mode(capabilities.agent_mode),
+              agent_behavior=to_proto_agent_behavior(
+                  capabilities.agent_behavior
+              ),
+              model=model_proto,
           )
       )
     return custom_agents_protos
 
   def _build_harness_config(self) -> localharness_pb2.HarnessConfig:
     """Translates Pydantic config objects into a HarnessConfig proto."""
-    main_agent_tool_protos = {}
+    all_tool_protos = {}
     if self._tool_runner:
       for fn in self._tool_runner.tools.values():
         proto = callable_to_tool_proto(fn, tool_runner=self._tool_runner)
-        main_agent_tool_protos[proto.name] = proto
+        all_tool_protos[proto.name] = proto
+
+    root_tool_protos = []
+    if self._tools is not None:
+      for tool in self._tools:
+        if isinstance(tool, str):
+          if tool in all_tool_protos:
+            root_tool_protos.append(all_tool_protos[tool])
+          else:
+            root_tool_protos.append(localharness_pb2.Tool(name=tool))
+        elif callable(tool):
+          proto = callable_to_tool_proto(tool, tool_runner=self._tool_runner)
+          all_tool_protos[proto.name] = proto
+          root_tool_protos.append(proto)
+    elif self._tool_runner:
+      # Fallback when _tools is not explicitly specified: exclude tools
+      # exclusive to subagents.
+      subagent_tool_names = set()
+      for sa in self._subagents:
+        for t in sa.tools or []:
+          if isinstance(t, str):
+            subagent_tool_names.add(t)
+          elif callable(t):
+            subagent_proto = callable_to_tool_proto(
+                t, tool_runner=self._tool_runner
+            )
+            subagent_tool_names.add(subagent_proto.name)
+      root_tool_protos = [
+          proto
+          for name, proto in all_tool_protos.items()
+          if name not in subagent_tool_names
+      ]
 
     system_instructions_proto = self._to_system_instructions_proto(
         self._system_instructions
@@ -1001,11 +1230,13 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
 
     enabled_hooks = self._get_enabled_hooks()
 
-    custom_agents_protos = self._build_custom_subagents_protos(
-        main_agent_tool_protos
+    compaction_proto, legacy_threshold = to_proto_compaction_config(
+        self._compaction_config, self._capabilities_config
     )
+
+    custom_agents_protos = self._build_custom_subagents_protos(all_tool_protos)
     harness_config = localharness_pb2.HarnessConfig(
-        tools=list(main_agent_tool_protos.values()),
+        tools=root_tool_protos,
         system_instructions=system_instructions_proto,
         cascade_id=self._conversation_id or "",
         session_continuation_mode=to_proto_session_continuation_mode(
@@ -1015,10 +1246,8 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
         workspaces=workspace_protos,
         skills_paths=self._skills_paths or [],
         harness_side_tools=harness_side_tools,
-        # 0 tells the harness to use its default (50000 tokens).
-        compaction_threshold=(
-            self._capabilities_config.compaction_threshold or 0
-        ),
+        compaction_threshold=legacy_threshold,
+        compaction_config=compaction_proto,
         finish_tool_schema_json=(
             self._capabilities_config.finish_tool_schema_json or ""
         ),
@@ -1031,12 +1260,25 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
         mcp_servers=mcp_server_protos,
         enabled_hooks=enabled_hooks,
         custom_subagents=custom_agents_protos,
-        agent_mode=to_proto_agent_mode(self._capabilities_config.agent_mode),
+        agent_behavior=to_proto_agent_behavior(
+            self._capabilities_config.agent_behavior
+        ),
     )
     if self._retry_config:
       retry_proto = build_retry_config_proto(self._retry_config)
       if retry_proto:
         harness_config.retry_config.CopyFrom(retry_proto)
+
+    if self._budget_config:
+      budget_proto = build_budget_config_proto(self._budget_config)
+      if budget_proto:
+        harness_config.budget_config.CopyFrom(budget_proto)
+
+    truncation_config = self._capabilities_config.tool_output_truncation_config
+    if truncation_config is not None:
+      trunc_proto = build_tool_output_truncation_proto(truncation_config)
+      if trunc_proto is not None:
+        harness_config.tool_output_truncation.CopyFrom(trunc_proto)
 
     if self._policies:
       policy_config, self._dynamic_policy_map = policy._to_policy_config_proto(
@@ -1080,6 +1322,14 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
         (
             self._hook_runner.on_tool_error_hooks,
             localharness_pb2.LIFECYCLE_HOOK_ON_TOOL_ERROR,
+        ),
+        (
+            self._hook_runner.on_compaction_hooks,
+            localharness_pb2.LIFECYCLE_HOOK_ON_COMPACTION,
+        ),
+        (
+            self._hook_runner.stop_hooks,
+            localharness_pb2.LIFECYCLE_HOOK_STOP,
         ),
     ]
     for hooks_list, hook_type in hook_mapping:
@@ -1209,27 +1459,19 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
       initial_history: list[types.Step] = []
       initial_usage = None
       initial_trajectory_usages = {}
+      sandbox_status = None
       if isinstance(raw_init_resp, (str, bytes)):
         init_resp_event = localharness_pb2.OutputEvent()
         json_format.Parse(raw_init_resp, init_resp_event)
         init_resp = init_resp_event.initialize_conversation_response
-        initial_history = [
-            event_processor.LocalConnectionStep.from_dict(
-                json_format.MessageToDict(
-                    step_update_proto, preserving_proto_field_name=True
-                )
-            )
-            for step_update_proto in init_resp.history
-        ]
-        if init_resp.HasField("cumulative_usage"):
-          initial_usage = event_processor.parse_usage_metadata(
-              init_resp.cumulative_usage
-          )
-        for entry in init_resp.trajectory_usage:
-          if entry.trajectory_id and entry.HasField("usage"):
-            initial_trajectory_usages[entry.trajectory_id] = (
-                event_processor.parse_usage_metadata(entry.usage)
-            )
+        parsed = event_processor.parse_initialize_response(init_resp)
+        initial_history = parsed.history
+        initial_usage = parsed.cumulative_usage
+        initial_trajectory_usages = parsed.trajectory_usages
+        sandbox_status = parsed.sandbox_status
+        warn_if_sandbox_unavailable(
+            harness_config.harness_side_tools.run_command, sandbox_status
+        )
     except Exception as e:
       process.kill()
       stderr_output = process.stderr.read().decode("utf-8")
@@ -1248,6 +1490,7 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
         dynamic_policy_map=self._dynamic_policy_map or None,
         initial_usage=initial_usage,
         initial_trajectory_usages=initial_trajectory_usages,
+        sandbox_status=sandbox_status,
     )
     self._connection._start_stderr_reader(process.stderr)
 
